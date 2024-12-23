@@ -1,0 +1,24 @@
+name: Release Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        type: choice
+        description: "Runs on"
+        options:
+          - ubuntu-latest
+          - self-hosted
+  push:
+    branches:
+      - main
+
+jobs:
+  call-docker-release:
+    permissions:
+      contents: read
+      packages: write
+    uses: thealtoclef/modular-automations/.github/workflows/docker-release.yaml@main
+    with:
+      runs_on: ${{ github.event.inputs.runs_on || 'self-hosted' }}
+      is_monorepo: true
