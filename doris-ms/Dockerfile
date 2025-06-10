@@ -1,5 +1,4 @@
-ARG VERSION=3.0.5
-FROM apache/doris:ms-$VERSION
+FROM apache/doris:ms-3.0.5
 
 ARG DORIS_HOME=/opt/apache-doris/ms
 
