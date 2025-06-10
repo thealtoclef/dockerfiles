@@ -1,7 +1,20 @@
-ARG VERSION=3.0.5
-FROM apache/doris:be-$VERSION
+# Build stage
+FROM maven:3-eclipse-temurin-17 AS builder
+
+# Clone and build the BigQuery Connector Plugin
+WORKDIR /workspace
+RUN git clone https://github.com/apache/doris-thirdparty.git --branch trino-435 --depth 1
+WORKDIR /workspace/doris-thirdparty/plugin/trino-bigquery
+RUN mvn clean install -DskipTests
+
+# Final stage
+FROM apache/doris:be-3.0.5
 
 ARG DORIS_HOME=/opt/apache-doris/be
+
+# Copy connectors from builder
+RUN mkdir -p ${DORIS_HOME}/connectors
+COPY --from=builder /workspace/doris-thirdparty/plugin/trino-bigquery/target/trino-bigquery-435 ${DORIS_HOME}/connectors/
 
 # Download JDBC drivers
 ARG POSTGRESQL_JDBC_VERSION=42.7.5
