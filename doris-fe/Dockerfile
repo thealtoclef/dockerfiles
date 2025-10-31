@@ -1,4 +1,4 @@
-FROM apache/doris:fe-3.0.5
+FROM apache/doris:fe-3.1.1
 
 ARG DORIS_HOME=/opt/apache-doris/fe
 
