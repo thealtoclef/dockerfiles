@@ -8,11 +8,6 @@ on:
         default: self-hosted
         required: false
         type: string
-      warp_build_profile:
-        description: "WarpBuild profile to build with"
-        default: ""
-        required: false
-        type: string
       platforms:
         description: "Platforms to build for"
         default: linux/amd64
@@ -33,5 +28,4 @@ jobs:
     uses: thealtoclef/modular-automations/.github/workflows/docker-release.yaml@main
     with:
       runs_on: ${{ github.event.inputs.runs_on || 'self-hosted' }}
-      warp_build_profile: ${{ github.event.inputs.warp_build_profile || '' }}
       platforms: ${{ github.event.inputs.profiles || 'linux/amd64' }}
