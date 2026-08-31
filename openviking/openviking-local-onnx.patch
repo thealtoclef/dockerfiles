@@ -202,7 +202,7 @@ index 00000000..84c5a84d
 +        self._client.close()
 +        self._async_client_cache.close_all_with_aclose()
 diff --git a/openviking/models/embedder/local_embedders.py b/openviking/models/embedder/local_embedders.py
-index 5d681964..277812ba 100644
+index 5d681964..d66c083d 100644
 --- a/openviking/models/embedder/local_embedders.py
 +++ b/openviking/models/embedder/local_embedders.py
 @@ -1,6 +1,6 @@
@@ -275,7 +275,7 @@ index 5d681964..277812ba 100644
  
  
  @dataclass(frozen=True)
-@@ -222,3 +268,299 @@ class LocalDenseEmbedder(DenseEmbedderBase):
+@@ -222,3 +268,298 @@ class LocalDenseEmbedder(DenseEmbedderBase):
          close_fn = getattr(self._llama, "close", None)
          if callable(close_fn):
              close_fn()
@@ -523,25 +523,24 @@ index 5d681964..277812ba 100644
 +
 +        # sparse: (B, seq) or (B, seq, 1) token weights -> ReLU, zero out
 +        # padded positions via the attention mask, drop the tokenizer's
-+        # special tokens, then collapse duplicate terms. Emit Dict[str, float].
-+        tokens = self._tokenizer.convert_ids_to_tokens(enc["input_ids"][0])
++        # special tokens, then max-pool duplicate tokens (BGE-M3's reference
++        # sparse behavior). Keys are vocab token ids as strings — the same
++        # keying as the remote bge-m3 provider, so a collection indexed with
++        # one stays sparse-compatible with the other under failover.
 +        weights = np.maximum(0.0, np.asarray(sparse[0], dtype="float32").reshape(-1))
 +        weights[~enc["attention_mask"][0].astype(bool)] = 0.0
 +        special_ids = self._special_token_ids()
 +        sparse_map: Dict[str, float] = {}
-+        for tok_id, term, w in zip(enc["input_ids"][0], tokens, weights):
++        for tok_id, w in zip(enc["input_ids"][0], weights):
 +            tid = int(tok_id)
 +            if tid in special_ids:
 +                continue
 +            if w <= 0.0:
 +                continue
-+            if term:
-+                # SentencePiece-style "▁" marks word starts; strip it so
-+                # duplicate sub-tokens collapse into one term.
-+                term = term.lstrip("▁")
-+            if not term:
-+                continue
-+            sparse_map[term] = sparse_map.get(term, 0.0) + float(w)
++            key = str(tid)
++            prev = sparse_map.get(key)
++            if prev is None or float(w) > prev:
++                sparse_map[key] = float(w)
 +
 +        self.update_token_usage(
 +            model_name=self.model_name,
