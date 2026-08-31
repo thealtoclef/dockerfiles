@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1.9
 #
-# OpenViking with self-hosted local models: hybrid (dense+sparse) embedding
-# and cross-encoder reranking run in-process on CPU (onnxruntime), instead
-# of vendor APIs. Cheap to build: starts from the prebuilt official image —
-# no Rust/npm/Python rebuild — and adds the runtime deps, the generated
-# source patch (openviking-local-onnx.patch; git apply fails the build if
-# the base image no longer matches it, by design), and both fp32 ONNX
-# models baked into /models. See README.md for patch provenance and ov.conf.
+# OpenViking with self-hosted local hybrid (dense+sparse) embedding running
+# in-process on CPU (onnxruntime), instead of vendor APIs. Cheap to build:
+# starts from the prebuilt official image — no Rust/npm/Python rebuild — and
+# adds the runtime deps, the generated source patch (openviking-local-onnx.
+# patch; git apply fails the build if the base image no longer matches it,
+# by design), and the fp32 ONNX model baked into /models. See README.md for
+# patch provenance and ov.conf.
 ARG OPENVIKING_BASE=ghcr.io/volcengine/openviking:latest
 FROM ${OPENVIKING_BASE}
 
@@ -29,13 +29,12 @@ COPY openviking-local-onnx.patch /tmp/openviking-local-onnx.patch
 RUN cd "${SITE_PACKAGES}" && git apply /tmp/openviking-local-onnx.patch \
  && rm /tmp/openviking-local-onnx.patch
 
-# 3. Bake the fp32 ONNX models (same author, a-ivanovitch; the only exports
-# exposing dense+sparse+colbert / relevance logit). ~4.5 GB total.
+# 3. Bake the fp32 ONNX model (a-ivanovitch export; the only one exposing
+# dense+sparse+colbert outputs). ~2.2 GB.
 # huggingface_hub is a BUILD-only need (snapshot_download); `uv run --with`
 # uses an ephemeral env so it never ships in the image.
 RUN mkdir -p /models && uv run --no-cache --with "huggingface_hub" python - <<'PYEOF'
 from huggingface_hub import snapshot_download
 
 snapshot_download("a-ivanovitch/bge-m3-onnx", local_dir="/models/bge-m3-onnx")
-snapshot_download("a-ivanovitch/bge-reranker-v2-m3-onnx", local_dir="/models/bge-reranker-v2-m3-onnx")
 PYEOF

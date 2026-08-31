@@ -1,9 +1,9 @@
 # openviking (local-onnx)
 
-Custom OpenViking image: official image + self-hosted local ONNX models —
-hybrid (dense+sparse) embedding **and** cross-encoder reranker
-(BGE-M3 / bge-reranker-v2-m3, onnxruntime CPU). No Rust/npm/Python rebuild:
-the heavy lifting is already compiled inside `ghcr.io/volcengine/openviking`.
+Custom OpenViking image: official image + self-hosted local ONNX hybrid
+(dense+sparse) embedding (BGE-M3, onnxruntime CPU). No Rust/npm/Python
+rebuild: the heavy lifting is already compiled inside
+`ghcr.io/volcengine/openviking`.
 
 ## Where the code lives
 
@@ -30,12 +30,11 @@ stale-feature builds (that was the flaw of the file-overlay approach).
 docker build -t <registry>/openviking:<tag> .
 ```
 
-Bakes both fp32 ONNX models (~4.5 GB) into `/models`:
+Bakes the fp32 ONNX model (~2.2 GB) into `/models`:
 
 | Role | HF repo | Path in image |
 |---|---|---|
 | Embedding (dense+sparse+colbert) | `a-ivanovitch/bge-m3-onnx` | `/models/bge-m3-onnx` |
-| Reranker (single relevance logit) | `a-ivanovitch/bge-reranker-v2-m3-onnx` | `/models/bge-reranker-v2-m3-onnx` |
 
 fp32 only — the authors ship no int8 (it measurably degrades retrieval/rank
 quality; see the HF READMEs).
@@ -51,10 +50,6 @@ embedding:
     model: bge-m3-onnx
     dimension: 1024
     model_path: /models/bge-m3-onnx
-rerank:
-  provider: local
-  model: bge-reranker-v2-m3-onnx
-  model_path: /models/bge-reranker-v2-m3-onnx
 ```
 
 ## Endgame
