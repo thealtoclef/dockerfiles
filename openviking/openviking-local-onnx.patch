@@ -23,7 +23,7 @@ index 229c35b9..cab70909 100644
      "LiteLLMDenseEmbedder",
      # MiniMax implementations
 diff --git a/openviking/models/embedder/local_embedders.py b/openviking/models/embedder/local_embedders.py
-index 5d681964..898b0dc9 100644
+index 5d681964..277812ba 100644
 --- a/openviking/models/embedder/local_embedders.py
 +++ b/openviking/models/embedder/local_embedders.py
 @@ -1,6 +1,6 @@
@@ -49,81 +49,54 @@ index 5d681964..898b0dc9 100644
  from openviking.storage.errors import EmbeddingConfigurationError
  from openviking_cli.utils import get_logger
  
-@@ -21,6 +27,18 @@ logger = get_logger(__name__)
+@@ -21,6 +27,46 @@ logger = get_logger(__name__)
  DEFAULT_LOCAL_MODEL_CACHE_DIR = "~/.cache/openviking/models"
  DEFAULT_LOCAL_DENSE_MODEL = "bge-small-zh-v1.5-f16"
  DEFAULT_BGE_ZH_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
-+LOCAL_HYBRID_ONNX_MODEL = "bge-m3-onnx"
-+LOCAL_HYBRID_ONNX_DIMENSION = 1024
-+# bge-m3 ONNX export (fp32, dense+sparse+colbert, CPU) — the export that
-+# actually exposes sparse output, which hybrid retrieval requires.
-+LOCAL_HYBRID_ONNX_REPO = "a-ivanovitch/bge-m3-onnx"
-+LOCAL_HYBRID_ONNX_SESS_FILE = "model_fp32.onnx"
-+# bge-m3 is a long-context model; the export is trained for 8192 tokens and
-+# the tokenizer handles it. Do not regress to a shorter window.
-+LOCAL_HYBRID_ONNX_MAX_LENGTH = 8192
-+# Token ids to strip from sparse lexical weights (BGE-M3 tokenizer-specific).
-+# <s>/CLS(0), <pad>(1), </s>/SEP(2), <unk>(3) add noise to lexical matching.
-+LOCAL_HYBRID_ONNX_STOPWORD_IDS = frozenset({0, 1, 2, 3})
++# Default names for the single ONNX session file when a model directory
++# contains more than one candidate.
++DEFAULT_ONNX_SESSION_FILE = "model.onnx"
++ONNX_SESSION_FILE_SUFFIXES = (".onnx",)
++# Fallback context window when the tokenizer declares none or an absurd one.
++ONNX_MAX_LENGTH_FALLBACK = 512
++ONNX_MAX_LENGTH_CAP = 8192
++
++
++def detect_intra_op_threads() -> int:
++    """Thread count for the ONNX Runtime intra-op pool.
++
++    ORT sizes its pool from the HOST core count and ignores cgroup CPU
++    limits, which oversubscribes throttled containers. Honor the cgroup
++    quota (v2 then v1) when present; fall back to the host core count.
++    """
++    import os
++
++    host = os.cpu_count() or 1
++    try:
++        # cgroup v2: "<quota> <period>", quota "max" when unlimited.
++        with open("/sys/fs/cgroup/cpu.max") as fh:
++            parts = fh.read().split()
++        if parts and parts[0] != "max":
++            quota, period = int(parts[0]), int(parts[1])
++            if quota > 0 and period > 0:
++                return max(1, min(host, quota // period))
++    except Exception:
++        pass
++    try:
++        # cgroup v1
++        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") as fh:
++            quota = int(fh.read().strip())
++        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us") as fh:
++            period = int(fh.read().strip())
++        if quota > 0 and period > 0:
++            return max(1, min(host, quota // period))
++    except Exception:
++        pass
++    return host
  
  
  @dataclass(frozen=True)
-@@ -45,6 +63,54 @@ LOCAL_DENSE_MODEL_SPECS: Dict[str, LocalModelSpec] = {
-     )
- }
- 
-+LOCAL_HYBRID_ONNX_SPECS: Dict[str, Dict[str, Any]] = {
-+    LOCAL_HYBRID_ONNX_MODEL: {
-+        "dimension": LOCAL_HYBRID_ONNX_DIMENSION,
-+        "repo": LOCAL_HYBRID_ONNX_REPO,
-+        "session_file": LOCAL_HYBRID_ONNX_SESS_FILE,
-+    },
-+}
-+
-+
-+def get_local_hybrid_onnx_spec(model_name: str) -> Dict[str, Any]:
-+    try:
-+        return LOCAL_HYBRID_ONNX_SPECS[model_name]
-+    except KeyError as exc:
-+        raise ValueError(
-+            f"Unknown local hybrid ONNX model '{model_name}'. "
-+            f"Supported models: {list(LOCAL_HYBRID_ONNX_SPECS.keys())}"
-+        ) from exc
-+
-+
-+def get_local_hybrid_onnx_default_dimension(model_name: str) -> int:
-+    return int(get_local_hybrid_onnx_spec(model_name)["dimension"])
-+
-+
-+def validate_local_model_spec(model_name: str) -> None:
-+    """Validate that a local model name is known — GGUF dense or ONNX hybrid.
-+
-+    For names in neither table, re-raise the GGUF dense "unknown model" error
-+    so existing validation messages stay stable for current callers.
-+    """
-+    try:
-+        get_local_model_spec(model_name)
-+    except ValueError as dense_exc:
-+        try:
-+            get_local_hybrid_onnx_spec(model_name)
-+        except ValueError:
-+            raise dense_exc
-+
-+
-+def get_local_any_default_dimension(model_name: str) -> int:
-+    """Resolve the dimension for any local model — GGUF dense or ONNX hybrid."""
-+    try:
-+        return get_local_model_default_dimension(model_name)
-+    except ValueError as dense_exc:
-+        try:
-+            return get_local_hybrid_onnx_default_dimension(model_name)
-+        except ValueError:
-+            raise dense_exc
-+
- 
- def get_local_model_spec(model_name: str) -> LocalModelSpec:
-     try:
-@@ -222,3 +288,158 @@ class LocalDenseEmbedder(DenseEmbedderBase):
+@@ -222,3 +268,299 @@ class LocalDenseEmbedder(DenseEmbedderBase):
          close_fn = getattr(self._llama, "close", None)
          if callable(close_fn):
              close_fn()
@@ -132,17 +105,21 @@ index 5d681964..898b0dc9 100644
 +class LocalONNXHybridEmbedder(HybridEmbedderBase):
 +    """Dense + sparse hybrid embedder backed by a local ONNX model (CPU).
 +
-+    A single ONNX session produces both the L2-normalized dense vector and the
-+    per-token sparse lexical weights. Sparse output is emitted as
-+    ``{term: weight}`` so it plugs straight into the local vector store's
-+    ``sparse_raw_terms`` / ``sparse_values`` and its native dense+sparse fusion.
++    Works with any ONNX export whose session exposes a dense output and a
++    per-token sparse lexical-weight output (shape ``(batch, seq)`` or
++    ``(batch, seq, 1)``); nothing is keyed on the model name. The output
++    names, dense dimension, context window (tokenizer's declared maximum),
++    and the special-token ids stripped from sparse weights are all
++    discovered from the model artifacts at load time.
 +
-+    Supported models are listed in ``LOCAL_HYBRID_ONNX_SPECS``.
++    Sparse output is emitted as ``{term: weight}`` so it plugs straight into
++    the local vector store's ``sparse_raw_terms`` / ``sparse_values`` and its
++    native dense+sparse fusion.
 +    """
 +
 +    def __init__(
 +        self,
-+        model_name: str = LOCAL_HYBRID_ONNX_MODEL,
++        model_name: str = "local-onnx-hybrid",
 +        model_path: Optional[str] = None,
 +        cache_dir: Optional[str] = None,
 +        dimension: Optional[int] = None,
@@ -152,20 +129,19 @@ index 5d681964..898b0dc9 100644
 +        runtime_config.setdefault("provider", "local")
 +        super().__init__(model_name, runtime_config)
 +
-+        spec = get_local_hybrid_onnx_spec(model_name)
-+        self.spec = spec
 +        self.cache_dir = cache_dir or DEFAULT_LOCAL_MODEL_CACHE_DIR
-+        self._dimension = dimension or int(spec["dimension"])
-+        if self._dimension != int(spec["dimension"]):
-+            raise ValueError(
-+                f"Local hybrid ONNX model '{model_name}' has fixed dimension "
-+                f"{spec['dimension']}, but got dimension={self._dimension}"
-+            )
++        self._requested_dimension = dimension
 +
 +        self._model_dir = self._resolve_model_dir(model_path)
 +        self._ort = self._import_ort()
 +        self._sess = self._load_session()
 +        self._tokenizer = self._load_tokenizer()
++        self._max_length = self._resolve_max_length()
++        self._dense_out, self._sparse_out = self._discover_outputs()
++
++        # Dimension: explicit config wins; else discovered from the dense
++        # output shape (static) or a one-token probe pass (dynamic shape).
++        self._dimension = self._resolve_dimension()
 +
 +    # -- setup ---------------------------------------------------------------
 +
@@ -181,30 +157,55 @@ index 5d681964..898b0dc9 100644
 +            ) from exc
 +
 +    def _resolve_model_dir(self, model_path: Optional[str]) -> Path:
-+        # model_path is required: models are baked into the image at build time.
++        # model_path is required: models are provisioned outside the app.
 +        if not model_path:
 +            raise EmbeddingConfigurationError(
 +                "Local hybrid ONNX embedding requires 'model_path' pointing at a "
-+                "pre-downloaded ONNX model directory (baked into the image at build). "
++                "pre-downloaded ONNX model directory. "
 +                "Set embedding.hybrid.model_path in ov.conf."
 +            )
 +        resolved = Path(model_path).expanduser().resolve()
-+        if not (resolved / self.spec["session_file"]).exists():
++        if not resolved.is_dir():
 +            raise EmbeddingConfigurationError(
-+                f"Local hybrid ONNX model directory not found or missing session "
-+                f"file {self.spec['session_file']}: {resolved}"
++                f"Local hybrid ONNX model directory not found: {resolved}"
 +            )
 +        return resolved
 +
++    def _find_session_file(self) -> Path:
++        """Locate the ONNX session file: the conventional name, else the sole
++        ``*.onnx`` file in the model directory."""
++        conventional = self._model_dir / DEFAULT_ONNX_SESSION_FILE
++        if conventional.exists():
++            return conventional
++        candidates = sorted(
++            p for p in self._model_dir.iterdir()
++            if p.is_file() and p.suffix.lower() in ONNX_SESSION_FILE_SUFFIXES
++        )
++        if not candidates:
++            raise EmbeddingConfigurationError(
++                f"No .onnx session file found in {self._model_dir}."
++            )
++        if len(candidates) > 1:
++            names = ", ".join(p.name for p in candidates)
++            raise EmbeddingConfigurationError(
++                f"Multiple .onnx files in {self._model_dir} ({names}); keep one "
++                "per model directory."
++            )
++        return candidates[0]
++
 +    def _load_session(self):
++        path = self._find_session_file()
 +        try:
++            session_options = self._ort.SessionOptions()
++            session_options.intra_op_num_threads = detect_intra_op_threads()
 +            return self._ort.InferenceSession(
-+                str(self._model_dir / self.spec["session_file"]),
++                str(path),
++                sess_options=session_options,
 +                providers=["CPUExecutionProvider"],
 +            )
 +        except Exception as exc:
 +            raise EmbeddingConfigurationError(
-+                f"Failed to load ONNX session from {self._model_dir}: {exc}"
++                f"Failed to load ONNX session from {path}: {exc}"
 +            ) from exc
 +
 +    def _load_tokenizer(self):
@@ -215,15 +216,103 @@ index 5d681964..898b0dc9 100644
 +                "Local hybrid ONNX embedding requires 'transformers' for the tokenizer. "
 +                "Install it or use the custom dockerfiles/openviking image."
 +            ) from exc
-+        # Both HF model repos keep all tokenizer files under tokenizer_hf/,
-+        # not at the repo root — load from there.
-+        tokenizer_dir = self._model_dir / "tokenizer_hf"
-+        try:
-+            return AutoTokenizer.from_pretrained(str(tokenizer_dir))
-+        except Exception as exc:
++        # HF model repos commonly keep tokenizer files under tokenizer_hf/
++        # (bge exports) or at the root; prefer the conventional subdir, then
++        # the directory root.
++        for candidate in (self._model_dir / "tokenizer_hf", self._model_dir):
++            if (candidate / "tokenizer_config.json").exists() or (
++                candidate / "tokenizer.json"
++            ).exists():
++                try:
++                    return AutoTokenizer.from_pretrained(str(candidate))
++                except Exception as exc:
++                    raise EmbeddingConfigurationError(
++                        f"Failed to load tokenizer from {candidate}: {exc}"
++                    ) from exc
++        raise EmbeddingConfigurationError(
++            f"No tokenizer files found in {self._model_dir} (looked in tokenizer_hf/ "
++            "and the directory root)."
++        )
++
++    def _resolve_max_length(self) -> int:
++        """Context window: the tokenizer's declared maximum."""
++        declared = getattr(self._tokenizer, "model_max_length", None)
++        if isinstance(declared, int) and 0 < declared <= ONNX_MAX_LENGTH_CAP:
++            return declared
++        return ONNX_MAX_LENGTH_FALLBACK
++
++    def _discover_outputs(self):
++        """Bind the dense and sparse output names from the graph.
++
++        A sparse output is a graph output whose shape is per-token (rank >= 2
++        with a sequence axis) rather than a flat per-sequence vector.
++        """
++        graph_outputs = {o.name: o for o in self._sess.get_outputs()}
++        dense_name = None
++        sparse_name = None
++
++        # Prefer the conventional name, else the first per-token output.
++        if "sparse" in graph_outputs:
++            sparse_name = "sparse"
++        else:
++            for name, out in graph_outputs.items():
++                shape = out.shape
++                if len(shape) >= 2 and (
++                    isinstance(shape[1], int) or (shape[1] in (None, "?", "seq_len"))
++                ):
++                    if len(shape) == 2 and isinstance(shape[-1], int):
++                        # (batch, dim) looks like a dense vector output.
++                        continue
++                    sparse_name = name
++                    break
++        if not sparse_name:
 +            raise EmbeddingConfigurationError(
-+                f"Failed to load tokenizer from {tokenizer_dir}: {exc}"
-+            ) from exc
++                "Could not identify a sparse (per-token) output in the ONNX "
++                f"graph outputs {sorted(graph_outputs)}. This export does not "
++                "expose lexical weights, so hybrid retrieval cannot use it."
++            )
++        if "dense" in graph_outputs:
++            dense_name = "dense"
++        else:
++            dense_name = next(
++                (name for name in graph_outputs if name != sparse_name),
++                None,
++            )
++        if not dense_name:
++            raise EmbeddingConfigurationError(
++                f"Could not identify a dense output among {sorted(graph_outputs)}."
++            )
++        return dense_name, sparse_name
++
++    def _resolve_dimension(self) -> int:
++        """Dimension: explicit config > static graph shape > probe forward pass."""
++        dense_out = next(o for o in self._sess.get_outputs() if o.name == self._dense_out)
++        shape = dense_out.shape
++        if len(shape) == 2 and isinstance(shape[1], int) and shape[1] > 0:
++            discovered = int(shape[1])
++        else:
++            import numpy as np
++
++            probe_ids = np.zeros((1, 1), dtype="int64")
++            probe_mask = np.ones((1, 1), dtype="int64")
++            try:
++                probe = self._sess.run(
++                    [self._dense_out],
++                    {"input_ids": probe_ids, "attention_mask": probe_mask},
++                )[0]
++                discovered = int(np.asarray(probe).reshape(1, -1).shape[1])
++            except Exception as exc:
++                raise EmbeddingConfigurationError(
++                    "Could not determine the dense output dimension: the graph "
++                    f"shape is dynamic ({shape}) and a probe pass failed: {exc}. "
++                    "Set embedding.hybrid.dimension explicitly."
++                ) from exc
++        if self._requested_dimension and self._requested_dimension != discovered:
++            raise ValueError(
++                f"Local ONNX model '{self.model_name}' produces {discovered}-d dense "
++                f"vectors, but got dimension={self._requested_dimension}"
++            )
++        return discovered
 +
 +    # -- embed ----------------------------------------------------------------
 +
@@ -235,34 +324,41 @@ index 5d681964..898b0dc9 100644
 +            [text],
 +            padding=True,
 +            truncation=True,
-+            max_length=LOCAL_HYBRID_ONNX_MAX_LENGTH,
++            max_length=self._max_length,
 +            return_tensors="np",
 +        )
-+        dense, sparse, _colbert = self._sess.run(
-+            ["dense", "sparse", "colbert"],
++        dense, sparse = self._sess.run(
++            [self._dense_out, self._sparse_out],
 +            {
 +                "input_ids": enc["input_ids"].astype("int64"),
 +                "attention_mask": enc["attention_mask"].astype("int64"),
 +            },
 +        )
 +
-+        # dense: (B,1024) already L2-normalized by the export.
-+        dense_vec = [float(x) for x in dense[0]]
++        # dense: (B, dim) — L2-normalize here if the export does not.
++        dense_row = np.asarray(dense[0], dtype="float32").reshape(-1)
++        norm = float(np.linalg.norm(dense_row))
++        if norm > 0:
++            dense_row = dense_row / norm
++        dense_vec = [float(x) for x in dense_row]
 +
-+        # sparse: (B, seq, 1) token weights -> ReLU, drop padded positions via
-+        # the attention mask, drop CLS/SEP/stopword tokens, then collapse
-+        # duplicate terms. Emit Dict[str, float].
++        # sparse: (B, seq) or (B, seq, 1) token weights -> ReLU, zero out
++        # padded positions via the attention mask, drop the tokenizer's
++        # special tokens, then collapse duplicate terms. Emit Dict[str, float].
 +        tokens = self._tokenizer.convert_ids_to_tokens(enc["input_ids"][0])
 +        weights = np.maximum(0.0, np.asarray(sparse[0], dtype="float32").reshape(-1))
 +        weights[~enc["attention_mask"][0].astype(bool)] = 0.0
++        special_ids = self._special_token_ids()
 +        sparse_map: Dict[str, float] = {}
 +        for tok_id, term, w in zip(enc["input_ids"][0], tokens, weights):
 +            tid = int(tok_id)
-+            if tid in LOCAL_HYBRID_ONNX_STOPWORD_IDS:
++            if tid in special_ids:
 +                continue
 +            if w <= 0.0:
 +                continue
-+            if not term or term.startswith("▁"):
++            if term:
++                # SentencePiece-style "▁" marks word starts; strip it so
++                # duplicate sub-tokens collapse into one term.
 +                term = term.lstrip("▁")
 +            if not term:
 +                continue
@@ -276,6 +372,24 @@ index 5d681964..898b0dc9 100644
 +        )
 +        return EmbedResult(dense_vector=dense_vec, sparse_vector=sparse_map or None)
 +
++    def _special_token_ids(self) -> frozenset:
++        """Special-token ids from the tokenizer (CLS/SEP/pad/unk etc.), used
++        to strip noise tokens from sparse lexical weights."""
++        ids = set()
++        for attr in (
++            "cls_token_id",
++            "sep_token_id",
++            "pad_token_id",
++            "unk_token_id",
++            "bos_token_id",
++            "eos_token_id",
++            "mask_token_id",
++        ):
++            value = getattr(self._tokenizer, attr, None)
++            if isinstance(value, int):
++                ids.add(value)
++        return frozenset(ids)
++
 +    def get_dimension(self) -> int:
 +        return self._dimension
 +
@@ -284,10 +398,10 @@ index 5d681964..898b0dc9 100644
 +        pass
 diff --git a/openviking/models/rerank/local_rerank.py b/openviking/models/rerank/local_rerank.py
 new file mode 100644
-index 00000000..24c50e7b
+index 00000000..3ac9e2a1
 --- /dev/null
 +++ b/openviking/models/rerank/local_rerank.py
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,241 @@
 +# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 +# SPDX-License-Identifier: AGPL-3.0
 +"""Local ONNX cross-encoder reranker via onnxruntime (CPU)."""
@@ -299,6 +413,9 @@ index 00000000..24c50e7b
 +from pathlib import Path
 +from typing import Any, List, Optional
 +
++import numpy as np
++
++from openviking.models.embedder.local_embedders import detect_intra_op_threads
 +from openviking.models.rerank.base import RerankBase
 +from openviking.storage.errors import EmbeddingConfigurationError
 +from openviking_cli.utils import get_logger
@@ -306,28 +423,27 @@ index 00000000..24c50e7b
 +logger = get_logger(__name__)
 +
 +DEFAULT_LOCAL_RERANK_CACHE_DIR = "~/.cache/openviking/models"
-+# Most-adopted CPU-tagged ONNX export of bge-reranker-v2-m3 (sequence
-+# classification, fp32, ~2.2 GB). Exposes a single relevance logit per pair.
-+DEFAULT_LOCAL_RERANK_REPO = "a-ivanovitch/bge-reranker-v2-m3-onnx"
-+DEFAULT_LOCAL_RERANK_SESS_FILE = "model_fp32.onnx"
-+DEFAULT_LOCAL_RERANK_MODEL = "bge-reranker-v2-m3-onnx"
-+# The base model supports 8192-token context; keep the full window like the
-+# embedder (the ONNX export does not cap it at a shorter value).
-+LOCAL_RERANK_MAX_LENGTH = 8192
 +
 +
 +class LocalONNXRerankClient(RerankBase):
 +    """Cross-encoder reranker backed by a local ONNX model via ONNX Runtime (CPU).
 +
-+    One ONNX session scores a query against a batch of documents. Output is a
-+    single logit per (query, doc) pair, converted to a 0..1 relevance score via
-+    sigmoid. Pairs are scored one at a time so memory stays bounded even for
-+    long documents on small CPU-only containers.
++    Works with any ONNX sequence-classification export that produces a single
++    relevance score per (query, document) pair — nothing is keyed on the
++    model name. The session file is discovered from the model directory
++    (``*.onnx``) and the score output is identified by its per-pair shape
++    rather than by name. The context window comes from the tokenizer's
++    declared maximum; the runtime-level ``rerank.max_input_tokens`` budget
++    bounds each pair before the tokenizer sees it.
++
++    Output is one score per pair, passed through a sigmoid to 0..1. Pairs are
++    scored one at a time so memory stays bounded even for long documents on
++    small CPU-only containers.
 +    """
 +
 +    def __init__(
 +        self,
-+        model_name: str = DEFAULT_LOCAL_RERANK_MODEL,
++        model_name: str = "local-onnx-rerank",
 +        model_path: Optional[str] = None,
 +        cache_dir: Optional[str] = None,
 +        config: Optional[Any] = None,
@@ -342,6 +458,8 @@ index 00000000..24c50e7b
 +        self._ort = self._import_ort()
 +        self._sess = self._load_session()
 +        self._tokenizer = self._load_tokenizer()
++        self._max_length = self._resolve_max_length()
++        self._score_out = self._discover_score_output()
 +
 +    # -- setup ---------------------------------------------------------------
 +
@@ -356,28 +474,55 @@ index 00000000..24c50e7b
 +            ) from exc
 +
 +    def _resolve_model_dir(self, model_path: Optional[str]) -> Path:
-+        # model_path is required: models are baked into the image at build time.
++        # model_path is required: models are provisioned outside the app.
 +        if not model_path:
 +            raise EmbeddingConfigurationError(
 +                "Local ONNX reranking requires 'model_path' pointing at a "
-+                "pre-downloaded ONNX model directory (baked into the image at build). "
-+                "Set rerank.model_path in ov.conf."
++                "pre-downloaded ONNX model directory. Set rerank.model_path in ov.conf."
 +            )
 +        resolved = Path(model_path).expanduser().resolve()
-+        if not (resolved / DEFAULT_LOCAL_RERANK_SESS_FILE).exists():
++        if not resolved.is_dir():
 +            raise EmbeddingConfigurationError(
-+                f"Local ONNX rerank model dir missing session file: {resolved}"
++                f"Local ONNX rerank model directory not found: {resolved}"
 +            )
 +        return resolved
 +
++    def _find_session_file(self) -> Path:
++        """Locate the ONNX session file: the conventional name, else the sole
++        ``*.onnx`` file in the model directory."""
++        conventional = self._model_dir / "model.onnx"
++        if conventional.exists():
++            return conventional
++        candidates = sorted(
++            p for p in self._model_dir.iterdir()
++            if p.is_file() and p.suffix.lower() == ".onnx"
++        )
++        if not candidates:
++            raise EmbeddingConfigurationError(
++                f"No .onnx session file found in {self._model_dir}."
++            )
++        if len(candidates) > 1:
++            names = ", ".join(p.name for p in candidates)
++            raise EmbeddingConfigurationError(
++                f"Multiple .onnx files in {self._model_dir} ({names}); keep one "
++                "per model directory."
++            )
++        return candidates[0]
++
 +    def _load_session(self):
++        path = self._find_session_file()
 +        try:
++            session_options = self._ort.SessionOptions()
++            session_options.intra_op_num_threads = detect_intra_op_threads()
 +            return self._ort.InferenceSession(
-+                str(self._model_dir / DEFAULT_LOCAL_RERANK_SESS_FILE),
++                str(path),
++                sess_options=session_options,
 +                providers=["CPUExecutionProvider"],
 +            )
 +        except Exception as exc:
-+            raise EmbeddingConfigurationError(f"Failed to load ONNX session: {exc}") from exc
++            raise EmbeddingConfigurationError(
++                f"Failed to load ONNX session from {path}: {exc}"
++            ) from exc
 +
 +    def _load_tokenizer(self):
 +        try:
@@ -387,20 +532,56 @@ index 00000000..24c50e7b
 +                "Local ONNX reranking requires 'transformers' for the tokenizer. "
 +                "Install it or use the custom dockerfiles/openviking image."
 +            ) from exc
-+        # Both HF model repos keep all tokenizer files under tokenizer_hf/,
-+        # not at the repo root — load from there.
-+        tokenizer_dir = self._model_dir / "tokenizer_hf"
-+        try:
-+            return AutoTokenizer.from_pretrained(str(tokenizer_dir))
-+        except Exception as exc:
-+            raise EmbeddingConfigurationError(
-+                f"Failed to load tokenizer from {tokenizer_dir}: {exc}"
-+            ) from exc
++        # HF model repos commonly keep tokenizer files under tokenizer_hf/
++        # (bge exports) or at the root; prefer the conventional subdir, then
++        # the directory root.
++        for candidate in (self._model_dir / "tokenizer_hf", self._model_dir):
++            if (candidate / "tokenizer_config.json").exists() or (
++                candidate / "tokenizer.json"
++            ).exists():
++                try:
++                    return AutoTokenizer.from_pretrained(str(candidate))
++                except Exception as exc:
++                    raise EmbeddingConfigurationError(
++                        f"Failed to load tokenizer from {candidate}: {exc}"
++                    ) from exc
++        raise EmbeddingConfigurationError(
++            f"No tokenizer files found in {self._model_dir} (looked in tokenizer_hf/ "
++            "and the directory root)."
++        )
++
++    def _resolve_max_length(self) -> int:
++        """Context window: the tokenizer's declared maximum."""
++        declared = getattr(self._tokenizer, "model_max_length", None)
++        if isinstance(declared, int) and 0 < declared <= 8192:
++            return declared
++        return 512
++
++    def _discover_score_output(self) -> str:
++        """Bind the per-pair score output: the conventional name, or the
++        unique per-sequence (rank-2, unit-dim) output."""
++        graph_outputs = {o.name: o for o in self._sess.get_outputs()}
++        if "logits" in graph_outputs:
++            return "logits"
++        per_sequence = [
++            name
++            for name, out in graph_outputs.items()
++            if len(out.shape) == 2
++            and (isinstance(out.shape[1], int) or out.shape[1] in (None, "?"))
++            and (not isinstance(out.shape[1], int) or out.shape[1] == 1)
++        ]
++        if len(per_sequence) == 1:
++            return per_sequence[0]
++        raise EmbeddingConfigurationError(
++            "Could not identify the score output in the ONNX graph outputs "
++            f"{sorted(graph_outputs)} (expected exactly one (batch, 1) sequence-"
++            "classification output)."
++        )
 +
 +    # -- rerank ---------------------------------------------------------------
 +
 +    def rerank_batch(self, query: str, documents: List[str]) -> Optional[List[float]]:
-+        """Return a relevance score per document (0..1, sigmoid of the logit).
++        """Return a relevance score per document (0..1, sigmoid of the score).
 +
 +        Args:
 +            query: Query text
@@ -423,18 +604,17 @@ index 00000000..24c50e7b
 +                    doc,
 +                    padding=True,
 +                    truncation=True,
-+                    max_length=LOCAL_RERANK_MAX_LENGTH,
++                    max_length=self._max_length,
 +                    return_tensors="np",
 +                )
-+                logits, = self._sess.run(
-+                    ["logits"],
-+                    {
-+                        "input_ids": enc["input_ids"].astype("int64"),
-+                        "attention_mask": enc["attention_mask"].astype("int64"),
-+                    },
-+                )
-+                # sequence classification -> single logit -> sigmoid to 0..1
-+                score = float(logits.reshape(-1)[0])
++                inputs = {
++                    k: v.astype("int64")
++                    for k, v in enc.items()
++                    if k in {"input_ids", "attention_mask", "token_type_ids"}
++                }
++                raw = self._sess.run([self._score_out], inputs)[0]
++                # sequence classification -> single score per pair -> 0..1
++                score = float(np.asarray(raw, dtype="float32").reshape(-1)[0])
 +                scores.append(1.0 / (1.0 + math.exp(-score)))
 +                self.update_token_usage(
 +                    model_name=self.model_name,
@@ -458,7 +638,7 @@ index 00000000..24c50e7b
 +        if not config or not config.is_available():
 +            return None
 +        return cls(
-+            model_name=config.model or DEFAULT_LOCAL_RERANK_MODEL,
++            model_name=config.model or "local-onnx-rerank",
 +            model_path=config.model_path,
 +            cache_dir=config.cache_dir,
 +            config=config,
@@ -480,47 +660,69 @@ index 92a5a55a..c8fc9c82 100644
              ak=config.ak,
              sk=config.sk,
 diff --git a/openviking_cli/utils/config/embedding_config.py b/openviking_cli/utils/config/embedding_config.py
-index cd0be846..b89de568 100644
+index cd0be846..4d0be40c 100644
 --- a/openviking_cli/utils/config/embedding_config.py
 +++ b/openviking_cli/utils/config/embedding_config.py
-@@ -347,9 +347,9 @@ class EmbeddingModelConfig(BaseModel):
+@@ -116,7 +116,7 @@ class EmbeddingModelConfig(BaseModel):
+     )
+     model_path: Optional[str] = Field(
+         default=None,
+-        description="Explicit local GGUF model path for provider='local'.",
++        description="Explicit local model path for provider='local' (GGUF file, or ONNX model directory for hybrid).",
+     )
+     cache_dir: Optional[str] = Field(
+         default=None,
+@@ -347,9 +347,18 @@ class EmbeddingModelConfig(BaseModel):
                  )
  
          elif provider == "local":
 -            from openviking.models.embedder.local_embedders import get_local_model_spec
-+            from openviking.models.embedder.local_embedders import validate_local_model_spec
++            # A local model with an explicit model_path is self-describing:
++            # ONNX artifacts are introspected at load time (outputs, dimension,
++            # context window), so any model directory is accepted and a wrong
++            # one fails fast at embedder construction with a specific error.
++            # The name table only governs the cache-download path (no
++            # model_path), where the name selects the GGUF file to fetch.
++            if not self.model_path:
++                from openviking.models.embedder.local_embedders import (
++                    get_local_model_spec,
++                )
  
 -            get_local_model_spec(model)
-+            validate_local_model_spec(model)
++                get_local_model_spec(model)
  
      def _validate_credentials(self) -> None:
          """Validate each credential when credentials list is non-empty.
-@@ -462,10 +462,10 @@ class EmbeddingModelConfig(BaseModel):
- 
-         if provider == "local":
-             from openviking.models.embedder.local_embedders import (
--                get_local_model_default_dimension,
-+                get_local_any_default_dimension,
+@@ -465,6 +474,11 @@ class EmbeddingModelConfig(BaseModel):
+                 get_local_model_default_dimension,
              )
  
--            return get_local_model_default_dimension(model)
-+            return get_local_any_default_dimension(model)
++            # With an explicit model_path the artifact is self-describing; the
++            # dimension is discovered at embedder construction (graph shape or
++            # probe pass). Resolution here only covers the GGUF cache path.
++            if self.model_path:
++                return self.dimension
+             return get_local_model_default_dimension(model)
  
          if provider == "dashscope":
-             try:
-@@ -577,9 +577,9 @@ class EmbeddingModelConfig(BaseModel):
+@@ -577,8 +591,15 @@ class EmbeddingModelConfig(BaseModel):
              )
  
          if provider == "local":
 -            from openviking.models.embedder.local_embedders import get_local_model_default_dimension
-+            from openviking.models.embedder.local_embedders import get_local_any_default_dimension
++            from openviking.models.embedder.local_embedders import (
++                get_local_model_default_dimension,
++            )
  
--            return get_local_model_default_dimension(effective_model)
-+            return get_local_any_default_dimension(effective_model)
++            # Same model_path rule as _resolve_dimension_for: with an explicit
++            # model_path the ONNX artifact is introspected at load time, so
++            # only the GGUF name table resolves here.
++            if self.model_path:
++                return self.dimension
+             return get_local_model_default_dimension(effective_model)
  
          if provider == "dashscope":
-             try:
-@@ -725,6 +725,7 @@ class EmbeddingConfig(BaseModel):
+@@ -725,6 +746,7 @@ class EmbeddingConfig(BaseModel):
              JinaDenseEmbedder,
              LiteLLMDenseEmbedder,
              LocalDenseEmbedder,
@@ -528,7 +730,7 @@ index cd0be846..b89de568 100644
              MinimaxDenseEmbedder,
              OpenAIDenseEmbedder,
              VikingDBDenseEmbedder,
-@@ -984,6 +985,16 @@ class EmbeddingConfig(BaseModel):
+@@ -984,6 +1006,16 @@ class EmbeddingConfig(BaseModel):
                      "config": dict(runtime_config),
                  },
              ),
@@ -546,7 +748,7 @@ index cd0be846..b89de568 100644
  
          key = (provider, embedder_type)
 diff --git a/openviking_cli/utils/config/rerank_config.py b/openviking_cli/utils/config/rerank_config.py
-index bd26999d..29230476 100644
+index bd26999d..a0764853 100644
 --- a/openviking_cli/utils/config/rerank_config.py
 +++ b/openviking_cli/utils/config/rerank_config.py
 @@ -6,11 +6,11 @@ from pydantic import BaseModel, Field, model_validator
@@ -563,14 +765,15 @@ index bd26999d..29230476 100644
      )
  
      # VikingDB fields
-@@ -31,6 +31,16 @@ class RerankConfig(BaseModel):
+@@ -31,6 +31,17 @@ class RerankConfig(BaseModel):
          default=None, description="Model name for OpenAI-compatible or LiteLLM providers"
      )
  
-+    # Local ONNX provider fields (provider='local')
++    # Local ONNX provider fields (provider='local') — the model artifact is
++    # introspected at load time; model_path is all a local deployment sets.
 +    model_path: Optional[str] = Field(
 +        default=None,
-+        description="Explicit local ONNX model directory for provider='local' (baked into the image at build).",
++        description="Explicit local ONNX model directory for provider='local'.",
 +    )
 +    cache_dir: Optional[str] = Field(
 +        default=None,
@@ -580,7 +783,7 @@ index bd26999d..29230476 100644
      extra_headers: Optional[Dict[str, str]] = Field(
          default=None, description="Extra HTTP headers for OpenAI-compatible providers"
      )
-@@ -62,6 +72,8 @@ class RerankConfig(BaseModel):
+@@ -62,6 +73,8 @@ class RerankConfig(BaseModel):
          """Auto-detect provider from config fields when not explicitly set."""
          if self.provider:
              return self.provider.lower()
@@ -589,7 +792,7 @@ index bd26999d..29230476 100644
          if self.api_key and self.api_base:
              return "openai"
          if self.api_key:
-@@ -76,9 +88,9 @@ class RerankConfig(BaseModel):
+@@ -76,9 +89,9 @@ class RerankConfig(BaseModel):
              raise ValueError("Rerank max_input_tokens must be 0 or at least 128")
  
          provider = self._effective_provider()
@@ -601,7 +804,7 @@ index bd26999d..29230476 100644
              )
          if provider == "openai":
              if not self.api_key or not self.api_base:
-@@ -99,6 +111,8 @@ class RerankConfig(BaseModel):
+@@ -99,6 +112,8 @@ class RerankConfig(BaseModel):
              return self.api_key is not None and self.api_base is not None
          if p == "litellm":
              return self.model is not None

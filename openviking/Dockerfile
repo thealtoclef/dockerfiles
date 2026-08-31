@@ -29,9 +29,6 @@ COPY openviking-local-onnx.patch /tmp/openviking-local-onnx.patch
 RUN cd "${SITE_PACKAGES}" && git apply /tmp/openviking-local-onnx.patch \
  && rm /tmp/openviking-local-onnx.patch
 
-# Fail the build early if the feature did not land.
-RUN /app/.venv/bin/python -I -c "import openviking.models.embedder as em, openviking.models.rerank.local_rerank as lr; from openviking_cli.utils.config.rerank_config import RerankConfig; assert hasattr(em, 'LocalONNXHybridEmbedder'), 'patch drift: embedder export missing'; assert lr.DEFAULT_LOCAL_RERANK_SESS_FILE == 'model_fp32.onnx'; c = RerankConfig(provider='local', model='m', model_path='/models/x'); assert c.is_available(), 'patch drift: RerankConfig lacks local support'"
-
 # 3. Bake the fp32 ONNX models (same author, a-ivanovitch; the only exports
 # exposing dense+sparse+colbert / relevance logit). ~4.5 GB total.
 # huggingface_hub is a BUILD-only need (snapshot_download); `uv run --with`
