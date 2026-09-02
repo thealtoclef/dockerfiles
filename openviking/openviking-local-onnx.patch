@@ -575,7 +575,7 @@ index 5d681964..d66c083d 100644
 +        # ONNX Runtime sessions are closed on GC; nothing to release eagerly.
 +        pass
 diff --git a/openviking/retrieve/hierarchical_retriever.py b/openviking/retrieve/hierarchical_retriever.py
-index fbce1475..7ad9893e 100644
+index fbce1475..c868ba1a 100644
 --- a/openviking/retrieve/hierarchical_retriever.py
 +++ b/openviking/retrieve/hierarchical_retriever.py
 @@ -78,6 +78,7 @@ class HierarchicalRetriever:
@@ -665,7 +665,7 @@ index fbce1475..7ad9893e 100644
 +            # One rerank call for the whole wave: merging the children's
 +            # candidate lists avoids a serial HTTP round trip per child.
 +            if self._rerank_client and mode == RetrieverMode.THINKING:
-+                batch_results = await self._rerank_scores_batched(query.query, batch_results)
++                batch_results = await self._rerank_scores_batched(query, batch_results)
 +
              telemetry = get_current_telemetry()
              for (_, current_score), results in zip(batch, batch_results, strict=True):
