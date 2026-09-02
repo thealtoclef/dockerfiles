@@ -574,6 +574,112 @@ index 5d681964..d66c083d 100644
 +    def close(self):
 +        # ONNX Runtime sessions are closed on GC; nothing to release eagerly.
 +        pass
+diff --git a/openviking/retrieve/hierarchical_retriever.py b/openviking/retrieve/hierarchical_retriever.py
+index fbce1475..7ad9893e 100644
+--- a/openviking/retrieve/hierarchical_retriever.py
++++ b/openviking/retrieve/hierarchical_retriever.py
+@@ -78,6 +78,7 @@ class HierarchicalRetriever:
+         self.embedder = embedder
+         self.rerank_config = rerank_config
+         self.rerank_max_input_tokens = rerank_config.max_input_tokens if rerank_config else 0
++        self.rerank_max_docs = (rerank_config.max_docs if rerank_config else 0) or 0
+         self.retrieval_config = retrieval_config or RetrievalConfig()
+         self.hotness_alpha = self.retrieval_config.hotness_alpha
+         self.score_propagation_alpha = self.retrieval_config.score_propagation_alpha
+@@ -368,13 +369,55 @@ class HierarchicalRetriever:
+             return score >= threshold
+         return score > threshold
+ 
++    async def _rerank_scores_batched(
++        self,
++        query: str,
++        result_groups: List[List[Dict[str, Any]]],
++    ) -> List[List[Dict[str, Any]]]:
++        """Rerank every result group of a wave in a single provider call.
++
++        The per-child loop below previously awaited one rerank request per
++        group; on self-hosted endpoints each call is dominated by fixed HTTP
++        round-trip cost, so merging the groups into one batch removes that
++        multiplication without changing which documents are reranked.
++
++        Returns the same groups with ``_score`` replaced by rerank scores
++        where reranking applied (groups are returned unchanged on any
++        failure, mirroring ``_rerank_scores`` fallback semantics).
++        """
++        merged: List[Dict[str, Any]] = []
++        group_sizes: List[int] = []
++        for group in result_groups:
++            group_sizes.append(len(group))
++            merged.extend(group)
++        if not merged:
++            return result_groups
++
++        documents = [str(r.get("abstract", "")) for r in merged]
++        fallback_scores = [self._finite_score(r.get("_score", 0.0)) for r in merged]
++        merged_scores = await self._rerank_scores(query, documents, fallback_scores)
++
++        reranked: List[List[Dict[str, Any]]] = []
++        cursor = 0
++        for group, size in zip(result_groups, group_sizes, strict=True):
++            for offset in range(size):
++                group[offset]["_score"] = merged_scores[cursor + offset]
++            reranked.append(group)
++            cursor += size
++        return reranked
++
+     async def _rerank_scores(
+         self,
+         query: str,
+         documents: List[str],
+         fallback_scores: List[float],
+     ) -> List[float]:
+-        """Return rerank scores or fall back to vector scores."""
++        """Return rerank scores or fall back to vector scores.
++
++        Only the top ``rerank_max_docs`` documents by vector score are reranked
++        when ``rerank_max_docs`` > 0; the rest keep their vector scores (the
++        latency-accuracy trade-off proposed upstream in volcengine/OpenViking#2880).
++        """
+         if not self._rerank_client or not documents:
+             return fallback_scores
+ 
+@@ -385,6 +428,14 @@ class HierarchicalRetriever:
+         if not rerank_documents:
+             return fallback_scores
+ 
++        if self.rerank_max_docs > 0 and len(rerank_documents) > self.rerank_max_docs:
++            rerank_documents = sorted(
++                rerank_documents,
++                key=lambda pair: fallback_scores[pair[0]],
++                reverse=True,
++            )[: self.rerank_max_docs]
++            rerank_documents.sort(key=lambda pair: pair[0])
++
+         if self.rerank_max_input_tokens > 0:
+             max_query_tokens = self.rerank_max_input_tokens * 3 // 4
+             if estimate_text_tokens(query) > max_query_tokens:
+@@ -512,6 +563,11 @@ class HierarchicalRetriever:
+                 *(search_children(current_uri) for current_uri, _ in batch)
+             )
+ 
++            # One rerank call for the whole wave: merging the children's
++            # candidate lists avoids a serial HTTP round trip per child.
++            if self._rerank_client and mode == RetrieverMode.THINKING:
++                batch_results = await self._rerank_scores_batched(query.query, batch_results)
++
+             telemetry = get_current_telemetry()
+             for (_, current_score), results in zip(batch, batch_results, strict=True):
+                 telemetry.count("vector.searches", 1)
+@@ -522,9 +578,6 @@ class HierarchicalRetriever:
+                     continue
+ 
+                 query_scores = [self._finite_score(r.get("_score", 0.0)) for r in results]
+-                if self._rerank_client and mode == RetrieverMode.THINKING:
+-                    documents = [str(r.get("abstract", "")) for r in results]
+-                    query_scores = await self._rerank_scores(query, documents, query_scores)
+ 
+                 for r, score in zip(results, query_scores, strict=True):
+                     uri = r.get("uri", "")
 diff --git a/openviking_cli/utils/config/embedding_config.py b/openviking_cli/utils/config/embedding_config.py
 index cd0be846..c4bdfe3f 100644
 --- a/openviking_cli/utils/config/embedding_config.py
@@ -750,3 +856,24 @@ index cd0be846..c4bdfe3f 100644
          }
  
          key = (provider, embedder_type)
+diff --git a/openviking_cli/utils/config/rerank_config.py b/openviking_cli/utils/config/rerank_config.py
+index bd26999d..d0037b96 100644
+--- a/openviking_cli/utils/config/rerank_config.py
++++ b/openviking_cli/utils/config/rerank_config.py
+@@ -56,6 +56,16 @@ class RerankConfig(BaseModel):
+         ),
+     )
+ 
++    max_docs: int = Field(
++        default=0,
++        ge=0,
++        description=(
++            "Maximum number of documents reranked per call; only the top-N "
++            "candidates by vector score are reranked and the rest keep their "
++            "vector scores. 0 (default) reranks every candidate"
++        ),
++    )
++
+     model_config = {"extra": "forbid"}
+ 
+     def _effective_provider(self) -> Optional[str]:
