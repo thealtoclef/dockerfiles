@@ -60,7 +60,7 @@ drop this Dockerfile entirely and mount models into the official image).
 
 ## Caveats
 
-- Base defaults to `:latest`; the patch is generated against a specific base
-  commit. Pin `OPENVIKING_BASE` (e.g. `ghcr.io/volcengine/openviking:v0.4.9`)
-  for reproducible builds.
+- Base is pinned to `ghcr.io/volcengine/openviking:v0.4.17.1`; the patch is
+  generated from the matching `v0.4.17.1-next` branch in the OpenViking fork.
+  Bump both together.
 - The base venv is uv-managed (no pip) — deps install via `uv pip`.

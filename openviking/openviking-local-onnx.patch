@@ -1,16 +1,17 @@
 diff --git a/openviking/models/embedder/__init__.py b/openviking/models/embedder/__init__.py
-index 229c35b9..0a91172e 100644
+index 229c35b9..6b260e61 100644
 --- a/openviking/models/embedder/__init__.py
 +++ b/openviking/models/embedder/__init__.py
-@@ -18,6 +18,7 @@ Supported providers:
- - LiteLLM: Dense only (bridges to OpenRouter, Ollama, vLLM, and many others)
- """
+@@ -9,7 +9,7 @@ Provides three embedder abstractions:
+ - HybridEmbedderBase: Returns both dense and sparse vectors
  
-+from openviking.models.embedder.bgem3_embedders import BGEM3HybridEmbedder
- from openviking.models.embedder.base import (
-     AllCredentialsFailedError,
-     CompositeHybridEmbedder,
-@@ -36,7 +37,10 @@ try:
+ Supported providers:
+-- OpenAI: Dense only
++- OpenAI: Dense, and Hybrid against backends serving BGE-M3's return_sparse flag
+ - Volcengine: Dense, Sparse, Hybrid
+ - Jina AI: Dense only
+ - Voyage AI: Dense only
+@@ -36,14 +36,20 @@ try:
  except ImportError:
      GeminiDenseEmbedder = None  # google-genai not installed
  from openviking.models.embedder.jina_embedders import JinaDenseEmbedder
@@ -22,16 +23,18 @@ index 229c35b9..0a91172e 100644
  
  try:
      from openviking.models.embedder.litellm_embedders import LiteLLMDenseEmbedder
-@@ -57,6 +61,8 @@ from openviking.models.embedder.volcengine_embedders import (
- from openviking.models.embedder.voyage_embedders import VoyageDenseEmbedder
- 
- __all__ = [
-+    # BGE-M3 implementations (self-hosted bge-m3-embedding-server)
-+    "BGEM3HybridEmbedder",
-     # Cohere implementations
-     "CohereDenseEmbedder",
-     # DashScope implementations
-@@ -75,6 +81,7 @@ __all__ = [
+ except ImportError:
+     LiteLLMDenseEmbedder = None  # litellm not installed
+ from openviking.models.embedder.minimax_embedders import MinimaxDenseEmbedder
+-from openviking.models.embedder.openai_embedders import OpenAIDenseEmbedder
++from openviking.models.embedder.openai_embedders import (
++    OpenAIDenseEmbedder,
++    OpenAIHybridEmbedder,
++)
+ from openviking.models.embedder.vikingdb_embedders import (
+     VikingDBDenseEmbedder,
+     VikingDBHybridEmbedder,
+@@ -75,12 +81,14 @@ __all__ = [
      # Jina AI implementations
      "JinaDenseEmbedder",
      "LocalDenseEmbedder",
@@ -39,170 +42,15 @@ index 229c35b9..0a91172e 100644
      # LiteLLM implementations
      "LiteLLMDenseEmbedder",
      # MiniMax implementations
-diff --git a/openviking/models/embedder/bgem3_embedders.py b/openviking/models/embedder/bgem3_embedders.py
-new file mode 100644
-index 00000000..84c5a84d
---- /dev/null
-+++ b/openviking/models/embedder/bgem3_embedders.py
-@@ -0,0 +1,156 @@
-+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-+# SPDX-License-Identifier: AGPL-3.0
-+"""BGE-M3 hybrid embedder backed by a self-hosted bge-m3-embedding-server.
-+
-+The server (Rust/Axum + ONNX Runtime, Apache-2.0) serves ``BAAI/bge-m3`` with
-+its native dense and sparse heads. Its ``/v1/embeddings:both`` endpoint runs
-+one forward pass per text and returns both representations, which is why this
-+is a single hybrid embedder rather than a CompositeHybridEmbedder over two
-+providers.
-+
-+Sparse weights are returned keyed by vocabulary token id (as strings). The
-+local vector store hashes sparse term strings, so any consistent keying works;
-+string token ids are lossless and require no tokenizer on the client side.
-+"""
-+
-+from typing import Any, Dict, List, Optional
-+
-+import httpx
-+
-+from openviking.models.embedder.base import (
-+    EmbeddingInput,
-+    HybridEmbedderBase,
-+    EmbedResult,
-+    extract_text_from_content,
-+)
-+from openviking.utils.async_client_cache import LoopScopedAsyncClientCache
-+from openviking_cli.utils import get_logger
-+
-+logger = get_logger(__name__)
-+
-+BGE_M3_DIMENSION = 1024
-+DEFAULT_BGE_M3_API_BASE = "http://localhost:8081"
-+DEFAULT_BGE_M3_MODEL = "bge-m3"
-+
-+
-+class BGEM3HybridEmbedder(HybridEmbedderBase):
-+    """Hybrid embedder calling a bge-m3-embedding-server's combined endpoint.
-+
-+    The server always runs BGE-M3 (the ``model`` request field is accepted for
-+    OpenAI compatibility and ignored); it is still sent so the provider works
-+    against any future multi-model deployment of the same wire format.
-+    """
-+
-+    def __init__(
-+        self,
-+        model_name: str = DEFAULT_BGE_M3_MODEL,
-+        api_key: Optional[str] = None,
-+        api_base: Optional[str] = None,
-+        dimension: Optional[int] = None,
-+        config: Optional[Dict[str, Any]] = None,
-+    ):
-+        super().__init__(model_name, config)
-+        self.provider = "bge-m3"
-+
-+        self.api_base = (api_base or DEFAULT_BGE_M3_API_BASE).rstrip("/")
-+        self._dimension = dimension or BGE_M3_DIMENSION
-+        if self._dimension != BGE_M3_DIMENSION:
-+            raise ValueError(
-+                f"BGE-M3 has a fixed dimension of {BGE_M3_DIMENSION}, "
-+                f"but got dimension={self._dimension}"
-+            )
-+
-+        headers = {"Content-Type": "application/json"}
-+        if api_key:
-+            headers["Authorization"] = f"Bearer {api_key}"
-+        self._client = httpx.Client(base_url=self.api_base, headers=headers, timeout=60.0)
-+        self._async_client_cache = LoopScopedAsyncClientCache()
-+
-+    def _call_api(self, texts: List[str]) -> List[Dict[str, Any]]:
-+        resp = self._client.post(
-+            "/v1/embeddings:both",
-+            json={"input": texts, "model": self.model_name},
-+        )
-+        resp.raise_for_status()
-+        return resp.json()["data"]
-+
-+    async def _call_api_async(self, texts: List[str]) -> List[Dict[str, Any]]:
-+        client = self._async_client_cache.get(
-+            lambda: httpx.AsyncClient(base_url=self.api_base, headers=self._client.headers, timeout=60.0)
-+        )
-+        resp = await client.post(
-+            "/v1/embeddings:both",
-+            json={"input": texts, "model": self.model_name},
-+        )
-+        resp.raise_for_status()
-+        return resp.json()["data"]
-+
-+    @staticmethod
-+    def _to_result(entry: Dict[str, Any]) -> EmbedResult:
-+        sparse = entry["sparse_values"]
-+        sparse_vector = {
-+            str(idx): float(weight) for idx, weight in zip(sparse["indices"], sparse["values"])
-+        }
-+        return EmbedResult(
-+            dense_vector=[float(x) for x in entry["embedding"]],
-+            sparse_vector=sparse_vector or None,
-+        )
-+
-+    def embed(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
-+        text = extract_text_from_content(content)
-+        try:
-+            data = self._run_with_retry(
-+                lambda: self._call_api([text]),
-+                logger=logger,
-+                operation_name="bge-m3 embedding",
-+            )
-+            result = self._to_result(data[0])
-+        except httpx.HTTPStatusError as exc:
-+            raise RuntimeError(
-+                f"bge-m3 server error: {exc.response.status_code} {exc.response.text}"
-+            ) from exc
-+        except Exception as exc:
-+            raise RuntimeError(f"bge-m3 embedding failed: {exc}") from exc
-+
-+        self.update_token_usage(
-+            model_name=self.model_name,
-+            provider=self.provider,
-+            prompt_tokens=self._estimate_tokens(text),
-+            completion_tokens=0,
-+        )
-+        return result
-+
-+    async def embed_async(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
-+        text = extract_text_from_content(content)
-+
-+        async def _call() -> EmbedResult:
-+            data = await self._call_api_async([text])
-+            return self._to_result(data[0])
-+
-+        try:
-+            result = await self._run_with_async_retry(
-+                _call,
-+                logger=logger,
-+                operation_name="bge-m3 async embedding",
-+            )
-+        except httpx.HTTPStatusError as exc:
-+            raise RuntimeError(
-+                f"bge-m3 server error: {exc.response.status_code} {exc.response.text}"
-+            ) from exc
-+        except Exception as exc:
-+            raise RuntimeError(f"bge-m3 embedding failed: {exc}") from exc
-+
-+        self.update_token_usage(
-+            model_name=self.model_name,
-+            provider=self.provider,
-+            prompt_tokens=self._estimate_tokens(text),
-+            completion_tokens=0,
-+        )
-+        return result
-+
-+    def get_dimension(self) -> int:
-+        return self._dimension
-+
-+    def close(self):
-+        self._client.close()
-+        self._async_client_cache.close_all_with_aclose()
+     "MinimaxDenseEmbedder",
+     # OpenAI implementations
+     "OpenAIDenseEmbedder",
++    "OpenAIHybridEmbedder",
+     # Voyage implementations
+     "VoyageDenseEmbedder",
+     # Volcengine implementations
 diff --git a/openviking/models/embedder/local_embedders.py b/openviking/models/embedder/local_embedders.py
-index 5d681964..d66c083d 100644
+index 5d681964..bd74248d 100644
 --- a/openviking/models/embedder/local_embedders.py
 +++ b/openviking/models/embedder/local_embedders.py
 @@ -1,6 +1,6 @@
@@ -275,7 +123,7 @@ index 5d681964..d66c083d 100644
  
  
  @dataclass(frozen=True)
-@@ -222,3 +268,298 @@ class LocalDenseEmbedder(DenseEmbedderBase):
+@@ -222,3 +268,299 @@ class LocalDenseEmbedder(DenseEmbedderBase):
          close_fn = getattr(self._llama, "close", None)
          if callable(close_fn):
              close_fn()
@@ -525,8 +373,9 @@ index 5d681964..d66c083d 100644
 +        # padded positions via the attention mask, drop the tokenizer's
 +        # special tokens, then max-pool duplicate tokens (BGE-M3's reference
 +        # sparse behavior). Keys are vocab token ids as strings — the same
-+        # keying as the remote bge-m3 provider, so a collection indexed with
-+        # one stays sparse-compatible with the other under failover.
++        # keying as the remote OpenAI-compatible hybrid provider, so a
++        # collection indexed with one stays sparse-compatible with the other
++        # under failover.
 +        weights = np.maximum(0.0, np.asarray(sparse[0], dtype="float32").reshape(-1))
 +        weights[~enc["attention_mask"][0].astype(bool)] = 0.0
 +        special_ids = self._special_token_ids()
@@ -574,8 +423,514 @@ index 5d681964..d66c083d 100644
 +    def close(self):
 +        # ONNX Runtime sessions are closed on GC; nothing to release eagerly.
 +        pass
+diff --git a/openviking/models/embedder/openai_embedders.py b/openviking/models/embedder/openai_embedders.py
+index 5a738c40..b5de35de 100644
+--- a/openviking/models/embedder/openai_embedders.py
++++ b/openviking/models/embedder/openai_embedders.py
+@@ -11,6 +11,7 @@ from openviking.models.embedder.base import (
+     EmbedResult,
+     HybridEmbedderBase,
+     SparseEmbedderBase,
++    extract_text_from_content,
+ )
+ from openviking.models.vlm.registry import DEFAULT_AZURE_API_VERSION
+ from openviking.telemetry import get_current_telemetry
+@@ -20,110 +21,35 @@ from openviking_cli.utils import get_logger
+ logger = get_logger(__name__)
+ 
+ 
+-class OpenAIDenseEmbedder(DenseEmbedderBase):
+-    """OpenAI-Compatible Dense Embedder Implementation
+-
+-    Supports OpenAI embedding models (e.g., text-embedding-3-small, text-embedding-3-large)
+-    and OpenAI-compatible third-party models that support non-symmetric embeddings.
+-
+-    Note: Official OpenAI models are symmetric and do not support the input_type parameter.
+-    Non-symmetric mode (context='query'/'document') is only supported by OpenAI-compatible
+-    third-party models (e.g., BGE-M3, Jina, Cohere, etc.) that implement the input_type parameter.
+-
+-    Example:
+-        >>> # Symmetric mode (official OpenAI models)
+-        >>> embedder = OpenAIDenseEmbedder(
+-        ...     model_name="text-embedding-3-small",
+-        ...     api_key="sk-xxx",
+-        ...     dimension=1536
+-        ... )
+-        >>> result = embedder.embed("Hello world")
+-        >>> print(len(result.dense_vector))
+-        1536
++class OpenAIClientMixin:
++    """Mixin holding the OpenAI-compatible client and request plumbing.
+ 
+-        >>> # Non-symmetric mode (OpenAI-compatible third-party models)
+-        >>> embedder = OpenAIDenseEmbedder(
+-        ...     model_name="bge-m3",
+-        ...     api_key="your-api-key",
+-        ...     api_base="https://your-api-endpoint.com/v1",
+-        ...     query_param="query",
+-        ...     document_param="passage"
+-        ... )
+-        >>> query_vector = embedder.embed("search query", is_query=True)
+-        >>> doc_vector = embedder.embed("document text", is_query=False)
+-
+-        >>> # Multiple parameters with key=value format
+-        >>> advanced_embedder = OpenAIDenseEmbedder(
+-        ...     model_name="custom-model",
+-        ...     api_key="your-api-key",
+-        ...     api_base="https://your-api-endpoint.com/v1",
+-        ...     query_param="input_type=query,task=search,domain=finance",
+-        ...     document_param="input_type=passage,task=index,domain=finance"
+-        ... )
+-        >>> advanced_vector = advanced_embedder.embed("financial query", is_query=True)
++    The dense and hybrid embedders speak the same wire protocol and differ
++    only in which representations they ask for and read back, so client
++    construction, request assembly, vector truncation, dimension detection
++    and telemetry live here instead of being duplicated per representation.
+     """
+ 
+-    def __init__(
++    def _init_openai_client(
+         self,
+-        model_name: str = "text-embedding-3-small",
+-        api_key: Optional[str] = None,
+-        api_base: Optional[str] = None,
+-        api_version: Optional[str] = None,
+-        dimension: Optional[int] = None,
+-        query_param: Optional[str] = None,
+-        document_param: Optional[str] = None,
+-        config: Optional[Dict[str, Any]] = None,
+-        extra_headers: Optional[Dict[str, str]] = None,
+-        input_type: Optional[str] = None,
+-        provider: str = "openai",
+-        configured_provider: Optional[str] = None,
+-        encoding_format: Optional[Literal["float", "base64"]] = None,
+-        extra_body: Optional[Dict[str, Any]] = None,
+-    ):
+-        """Initialize OpenAI-Compatible Dense Embedder
+-
+-        Args:
+-            model_name: Model name. For official OpenAI models (e.g., text-embedding-3-small),
+-                       use symmetric mode (query_param=None, document_param=None).
+-                       For OpenAI-compatible third-party models (e.g., BGE-M3, Jina, Cohere), use
+-                       non-symmetric mode with query_param/document_param.
+-            api_key: API key, if None will read from env vars (OPENVIKING_EMBEDDING_API_KEY or OPENAI_API_KEY)
+-            api_base: API base URL, optional. Required for third-party OpenAI-compatible APIs.
+-            dimension: Target dimension for output vectors. If specified and the model returns vectors
+-                      with a different dimension, the output will be truncated to this dimension.
+-                      If None, uses the model's default dimension without truncation.
+-            query_param: Parameter for query-side embeddings. Supports simple values (e.g., 'query')
+-                         or key=value format (e.g., 'input_type=query,task=search'). Defaults to None.
+-                         Setting this (or document_param) activates non-symmetric mode.
+-                         Only supported by OpenAI-compatible third-party models.
+-            document_param: Parameter for document-side embeddings. Supports simple values (e.g., 'passage')
+-                           or key=value format (e.g., 'input_type=passage,task=index'). Defaults to None.
+-                           Setting this (or query_param) activates non-symmetric mode.
+-                           Only supported by OpenAI-compatible third-party models.
+-            config: Additional configuration dict
+-            extra_headers: Extra HTTP headers to include in API requests (e.g., for OpenRouter:
+-                          {'HTTP-Referer': 'https://your-site.com', 'X-Title': 'Your App'})
+-            encoding_format: Wire format for embedding values. ``None`` (default) lets the
+-                            OpenAI Python SDK pick its default (currently ``base64``). Set to
+-                            ``"float"`` to send/receive plain JSON arrays — the recommended
+-                            workaround when the upstream gateway cannot deserialize base64
+-                            embedding payloads correctly.
+-            extra_body: Extra JSON body fields merged into every embeddings request
+-                       (e.g., OpenRouter provider routing:
+-                       {'provider': {'sort': 'latency'}}). Keys set explicitly via
+-                       query_param/document_param take precedence on conflict.
+-
+-        Raises:
+-            ValueError: If api_key is not provided and env vars are not set
+-
+-        Note:
+-            Official OpenAI models (e.g., text-embedding-3-small, text-embedding-3-large) are
+-            symmetric and do not support the input_type parameter. Non-symmetric mode is only
+-            supported by OpenAI-compatible third-party models (e.g., BGE-M3, Jina, Cohere) that
+-            implement the input_type parameter.
++        *,
++        api_key: Optional[str],
++        api_base: Optional[str],
++        api_version: Optional[str],
++        dimension: Optional[int],
++        query_param: Optional[str],
++        document_param: Optional[str],
++        extra_headers: Optional[Dict[str, str]],
++        provider: str,
++        configured_provider: Optional[str],
++        encoding_format: Optional[Literal["float", "base64"]],
++        extra_body: Optional[Dict[str, Any]],
++    ) -> None:
++        """Build the sync client and resolve the output dimension.
++
++        Called from each embedder's ``__init__`` after ``EmbedderBase.__init__``,
++        which is what supplies ``max_concurrent`` for the connection pool.
+         """
+-        super().__init__(model_name, config)
+-
+         self.api_key = api_key
+         self.api_base = api_base
+         self.api_version = api_version
+@@ -303,6 +229,138 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
+ 
+         return self._async_client_cache.get(_build_async_client)
+ 
++    def get_dimension(self) -> int:
++        """Get embedding dimension
++
++        Returns:
++            int: Vector dimension
++        """
++        return self._dimension
++
++    def close(self):
++        """Close the sync client and all event-loop-scoped async clients."""
++        self.client.close()
++        self._async_client_cache.close_all_with_close()
++
++
++class OpenAIDenseEmbedder(OpenAIClientMixin, DenseEmbedderBase):
++    """OpenAI-Compatible Dense Embedder Implementation
++
++    Supports OpenAI embedding models (e.g., text-embedding-3-small, text-embedding-3-large)
++    and OpenAI-compatible third-party models that support non-symmetric embeddings.
++
++    Note: Official OpenAI models are symmetric and do not support the input_type parameter.
++    Non-symmetric mode (context='query'/'document') is only supported by OpenAI-compatible
++    third-party models (e.g., BGE-M3, Jina, Cohere, etc.) that implement the input_type parameter.
++
++    Example:
++        >>> # Symmetric mode (official OpenAI models)
++        >>> embedder = OpenAIDenseEmbedder(
++        ...     model_name="text-embedding-3-small",
++        ...     api_key="sk-xxx",
++        ...     dimension=1536
++        ... )
++        >>> result = embedder.embed("Hello world")
++        >>> print(len(result.dense_vector))
++        1536
++
++        >>> # Non-symmetric mode (OpenAI-compatible third-party models)
++        >>> embedder = OpenAIDenseEmbedder(
++        ...     model_name="bge-m3",
++        ...     api_key="your-api-key",
++        ...     api_base="https://your-api-endpoint.com/v1",
++        ...     query_param="query",
++        ...     document_param="passage"
++        ... )
++        >>> query_vector = embedder.embed("search query", is_query=True)
++        >>> doc_vector = embedder.embed("document text", is_query=False)
++
++        >>> # Multiple parameters with key=value format
++        >>> advanced_embedder = OpenAIDenseEmbedder(
++        ...     model_name="custom-model",
++        ...     api_key="your-api-key",
++        ...     api_base="https://your-api-endpoint.com/v1",
++        ...     query_param="input_type=query,task=search,domain=finance",
++        ...     document_param="input_type=passage,task=index,domain=finance"
++        ... )
++        >>> advanced_vector = advanced_embedder.embed("financial query", is_query=True)
++    """
++
++    def __init__(
++        self,
++        model_name: str = "text-embedding-3-small",
++        api_key: Optional[str] = None,
++        api_base: Optional[str] = None,
++        api_version: Optional[str] = None,
++        dimension: Optional[int] = None,
++        query_param: Optional[str] = None,
++        document_param: Optional[str] = None,
++        config: Optional[Dict[str, Any]] = None,
++        extra_headers: Optional[Dict[str, str]] = None,
++        input_type: Optional[str] = None,
++        provider: str = "openai",
++        configured_provider: Optional[str] = None,
++        encoding_format: Optional[Literal["float", "base64"]] = None,
++        extra_body: Optional[Dict[str, Any]] = None,
++    ):
++        """Initialize OpenAI-Compatible Dense Embedder
++
++        Args:
++            model_name: Model name. For official OpenAI models (e.g., text-embedding-3-small),
++                       use symmetric mode (query_param=None, document_param=None).
++                       For OpenAI-compatible third-party models (e.g., BGE-M3, Jina, Cohere), use
++                       non-symmetric mode with query_param/document_param.
++            api_key: API key, if None will read from env vars (OPENVIKING_EMBEDDING_API_KEY or OPENAI_API_KEY)
++            api_base: API base URL, optional. Required for third-party OpenAI-compatible APIs.
++            dimension: Target dimension for output vectors. If specified and the model returns vectors
++                      with a different dimension, the output will be truncated to this dimension.
++                      If None, uses the model's default dimension without truncation.
++            query_param: Parameter for query-side embeddings. Supports simple values (e.g., 'query')
++                         or key=value format (e.g., 'input_type=query,task=search'). Defaults to None.
++                         Setting this (or document_param) activates non-symmetric mode.
++                         Only supported by OpenAI-compatible third-party models.
++            document_param: Parameter for document-side embeddings. Supports simple values (e.g., 'passage')
++                           or key=value format (e.g., 'input_type=passage,task=index'). Defaults to None.
++                           Setting this (or query_param) activates non-symmetric mode.
++                           Only supported by OpenAI-compatible third-party models.
++            config: Additional configuration dict
++            extra_headers: Extra HTTP headers to include in API requests (e.g., for OpenRouter:
++                          {'HTTP-Referer': 'https://your-site.com', 'X-Title': 'Your App'})
++            encoding_format: Wire format for embedding values. ``None`` (default) lets the
++                            OpenAI Python SDK pick its default (currently ``base64``). Set to
++                            ``"float"`` to send/receive plain JSON arrays — the recommended
++                            workaround when the upstream gateway cannot deserialize base64
++                            embedding payloads correctly.
++            extra_body: Extra JSON body fields merged into every embeddings request
++                       (e.g., OpenRouter provider routing:
++                       {'provider': {'sort': 'latency'}}). Keys set explicitly via
++                       query_param/document_param take precedence on conflict.
++
++        Raises:
++            ValueError: If api_key is not provided and env vars are not set
++
++        Note:
++            Official OpenAI models (e.g., text-embedding-3-small, text-embedding-3-large) are
++            symmetric and do not support the input_type parameter. Non-symmetric mode is only
++            supported by OpenAI-compatible third-party models (e.g., BGE-M3, Jina, Cohere) that
++            implement the input_type parameter.
++        """
++        super().__init__(model_name, config)
++
++        self._init_openai_client(
++            api_key=api_key,
++            api_base=api_base,
++            api_version=api_version,
++            dimension=dimension,
++            query_param=query_param,
++            document_param=document_param,
++            extra_headers=extra_headers,
++            provider=provider,
++            configured_provider=configured_provider,
++            encoding_format=encoding_format,
++            extra_body=extra_body,
++        )
++
+     def embed(self, text: str, is_query: bool = False) -> EmbedResult:
+         """Perform dense embedding on text
+ 
+@@ -357,13 +415,6 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
+         except Exception as e:
+             raise RuntimeError(f"Embedding failed: {str(e)}") from e
+ 
+-    def get_dimension(self) -> int:
+-        """Get embedding dimension
+-
+-        Returns:
+-            int: Vector dimension
+-        """
+-        return self._dimension
+ 
+ 
+ class OpenAISparseEmbedder(SparseEmbedderBase):
+@@ -386,24 +437,190 @@ class OpenAISparseEmbedder(SparseEmbedderBase):
+         raise NotImplementedError()
+ 
+ 
+-class OpenAIHybridEmbedder(HybridEmbedderBase):
+-    """OpenAI does not support hybrid embedding
++class OpenAIHybridEmbedder(OpenAIClientMixin, HybridEmbedderBase):
++    """OpenAI-Compatible Hybrid Embedder (dense + sparse from one request)
++
++    The OpenAI embeddings wire format carries no lexical representation, so
++    this targets backends that extend it with BGE-M3's own ``return_dense`` /
++    ``return_sparse`` flags (self-hosted bge-m3-server, Xinference) and answer
++    with a ``sparse_embedding`` object alongside ``embedding`` in each entry.
++    Both flags are sent on every request; a backend that ignores them answers
++    dense-only and the first embed fails with a clear error rather than
++    silently indexing half a hybrid collection.
++
++    Requesting both costs one forward pass on such a backend, which is why
++    this is a single hybrid embedder rather than a CompositeHybridEmbedder
++    over two providers.
++
++    Sparse weights come back keyed by vocabulary token id. They are kept as
++    string token ids — the same keying LocalONNXHybridEmbedder produces, so a
++    collection indexed by one stays sparse-compatible with the other under
++    failover, and no tokenizer is needed on the client side.
+ 
+-    This class is a placeholder for error messaging. For hybrid embedding, use Volcengine or other providers.
++    Example:
++        >>> embedder = OpenAIHybridEmbedder(
++        ...     model_name="bge-m3",
++        ...     api_base="http://bge-m3:8081/v1",
++        ...     dimension=1024,
++        ... )
++        >>> result = embedder.embed("Hello world")
++        >>> result.is_hybrid
++        True
+     """
+ 
+-    def __init__(self, *args, **kwargs):
+-        model_name = kwargs.get("model_name")
+-        if model_name is None and args:
+-            model_name = str(args[0])
+-        super().__init__(model_name=model_name or "openai-hybrid-unsupported")
+-        raise NotImplementedError(
+-            "OpenAI does not support hybrid embeddings. "
+-            "Consider using VolcengineHybridEmbedder or other providers."
++    def __init__(
++        self,
++        model_name: str = "bge-m3",
++        api_key: Optional[str] = None,
++        api_base: Optional[str] = None,
++        api_version: Optional[str] = None,
++        dimension: Optional[int] = None,
++        query_param: Optional[str] = None,
++        document_param: Optional[str] = None,
++        config: Optional[Dict[str, Any]] = None,
++        extra_headers: Optional[Dict[str, str]] = None,
++        provider: str = "openai",
++        configured_provider: Optional[str] = None,
++        encoding_format: Optional[Literal["float", "base64"]] = None,
++        extra_body: Optional[Dict[str, Any]] = None,
++    ):
++        """Initialize OpenAI-Compatible Hybrid Embedder
++
++        Takes the same arguments as :class:`OpenAIDenseEmbedder`; see there for
++        their meaning. ``dimension`` is the dense width (1024 for BGE-M3) and
++        should be set explicitly, because a self-hosted model name carries no
++        dimension the config layer could infer for the collection schema.
++        """
++        super().__init__(model_name, config)
++
++        self._init_openai_client(
++            api_key=api_key,
++            api_base=api_base,
++            api_version=api_version,
++            dimension=dimension,
++            query_param=query_param,
++            document_param=document_param,
++            extra_headers=extra_headers,
++            provider=provider,
++            configured_provider=configured_provider,
++            encoding_format=encoding_format,
++            extra_body=extra_body,
+         )
+ 
+-    def embed(self, text: str, is_query: bool = False) -> EmbedResult:
+-        raise NotImplementedError()
++    def _detect_dimension(self) -> int:
++        """Probe the backend for its dense width.
+ 
+-    def get_dimension(self) -> int:
+-        raise NotImplementedError()
++        The dense embedder can fall back to OpenAI's 1536 when the probe
++        fails; a hybrid backend is self-hosted, so there is no such default —
++        a guessed width would be written into the collection schema and every
++        subsequent write would fail on dimension mismatch. Fail loudly here.
++        """
++        detected = len(self.embed("test").dense_vector or [])
++        if not detected:
++            raise RuntimeError(
++                f"Hybrid embedding backend at {self.api_base} returned no dense vector; "
++                "cannot determine the embedding dimension."
++            )
++        self._actual_model_dimension = detected
++        return detected
++
++    def _build_extra_body(self, is_query: bool = False) -> Dict[str, Any]:
++        """Ask for both representations on every request.
++
++        The flags are applied last so they win over anything configured via
++        ``extra_body`` or ``query_param``/``document_param``: an embedder
++        wired as hybrid that stopped asking for sparse weights would index a
++        dense-only collection under a hybrid schema.
++        """
++        extra_body = dict(super()._build_extra_body(is_query=is_query) or {})
++        extra_body["return_dense"] = True
++        extra_body["return_sparse"] = True
++        return extra_body
++
++    def _to_result(self, entry: Any) -> EmbedResult:
++        """Convert one response entry into a hybrid EmbedResult."""
++        sparse = getattr(entry, "sparse_embedding", None)
++        if sparse is None:
++            sparse = (getattr(entry, "model_extra", None) or {}).get("sparse_embedding")
++        if sparse is None:
++            raise RuntimeError(
++                f"Embeddings endpoint at {self.api_base} returned no 'sparse_embedding' for "
++                f"model '{self.model_name}'. A hybrid embedding config requires a backend that "
++                "honours BGE-M3's 'return_sparse' flag (e.g. bge-m3-server, Xinference); "
++                "use a dense config for a dense-only endpoint."
++            )
++
++        if isinstance(sparse, dict):
++            indices, values = sparse.get("indices"), sparse.get("values")
++        else:
++            indices, values = getattr(sparse, "indices", None), getattr(sparse, "values", None)
++        if indices is None or values is None:
++            raise RuntimeError(
++                f"Malformed 'sparse_embedding' from {self.api_base}: expected 'indices' and "
++                f"'values' arrays, got {sparse!r}"
++            )
++
++        sparse_vector = {
++            str(idx): float(weight) for idx, weight in zip(indices, values, strict=True)
++        }
++        return EmbedResult(
++            dense_vector=self._truncate_vector(entry.embedding),
++            sparse_vector=sparse_vector or None,
++        )
++
++    def embed(self, content: Any, is_query: bool = False) -> EmbedResult:
++        """Perform hybrid embedding on text
++
++        Args:
++            content: Input text, or a list of multimodal content parts (text parts only are used)
++            is_query: Flag to indicate if this is a query embedding
++
++        Returns:
++            EmbedResult: Result containing both dense_vector and sparse_vector
++
++        Raises:
++            RuntimeError: When the API call fails or the backend returns no sparse weights
++        """
++        text = extract_text_from_content(content)
++
++        def _call():
++            response = self.client.embeddings.create(**self._build_kwargs(text, is_query=is_query))
++            self._update_telemetry_token_usage(response)
++            return response.data[0]
++
++        try:
++            entry = self._run_with_retry(
++                _call,
++                logger=logger,
++                operation_name="OpenAI hybrid embedding",
++            )
++        except openai.APIError as e:
++            raise RuntimeError(f"OpenAI API error: {e.message}") from e
++        except Exception as e:
++            raise RuntimeError(f"Hybrid embedding failed: {str(e)}") from e
++
++        # Parsed outside the retry: a response without sparse weights means the
++        # endpoint is dense-only, which retrying cannot fix.
++        return self._to_result(entry)
++
++    async def embed_async(self, content: Any, is_query: bool = False) -> EmbedResult:
++        text = extract_text_from_content(content)
++        client = self._get_async_client()
++
++        async def _call():
++            response = await client.embeddings.create(**self._build_kwargs(text, is_query=is_query))
++            self._update_telemetry_token_usage(response)
++            return response.data[0]
++
++        try:
++            entry = await self._run_with_async_retry(
++                _call,
++                logger=logger,
++                operation_name="OpenAI async hybrid embedding",
++            )
++        except openai.APIError as e:
++            raise RuntimeError(f"OpenAI API error: {e.message}") from e
++        except Exception as e:
++            raise RuntimeError(f"Hybrid embedding failed: {str(e)}") from e
++
++        return self._to_result(entry)
 diff --git a/openviking/retrieve/hierarchical_retriever.py b/openviking/retrieve/hierarchical_retriever.py
-index fbce1475..c868ba1a 100644
+index e175d276..76c169d9 100644
 --- a/openviking/retrieve/hierarchical_retriever.py
 +++ b/openviking/retrieve/hierarchical_retriever.py
 @@ -78,6 +78,7 @@ class HierarchicalRetriever:
@@ -586,7 +941,7 @@ index fbce1475..c868ba1a 100644
          self.retrieval_config = retrieval_config or RetrievalConfig()
          self.hotness_alpha = self.retrieval_config.hotness_alpha
          self.score_propagation_alpha = self.retrieval_config.score_propagation_alpha
-@@ -368,13 +369,55 @@ class HierarchicalRetriever:
+@@ -343,13 +344,55 @@ class HierarchicalRetriever:
              return score >= threshold
          return score > threshold
  
@@ -643,7 +998,7 @@ index fbce1475..c868ba1a 100644
          if not self._rerank_client or not documents:
              return fallback_scores
  
-@@ -385,6 +428,14 @@ class HierarchicalRetriever:
+@@ -360,6 +403,14 @@ class HierarchicalRetriever:
          if not rerank_documents:
              return fallback_scores
  
@@ -658,7 +1013,7 @@ index fbce1475..c868ba1a 100644
          if self.rerank_max_input_tokens > 0:
              max_query_tokens = self.rerank_max_input_tokens * 3 // 4
              if estimate_text_tokens(query) > max_query_tokens:
-@@ -512,6 +563,11 @@ class HierarchicalRetriever:
+@@ -487,6 +538,11 @@ class HierarchicalRetriever:
                  *(search_children(current_uri) for current_uri, _ in batch)
              )
  
@@ -670,7 +1025,7 @@ index fbce1475..c868ba1a 100644
              telemetry = get_current_telemetry()
              for (_, current_score), results in zip(batch, batch_results, strict=True):
                  telemetry.count("vector.searches", 1)
-@@ -522,9 +578,6 @@ class HierarchicalRetriever:
+@@ -497,9 +553,6 @@ class HierarchicalRetriever:
                      continue
  
                  query_scores = [self._finite_score(r.get("_score", 0.0)) for r in results]
@@ -681,18 +1036,9 @@ index fbce1475..c868ba1a 100644
                  for r, score in zip(results, query_scores, strict=True):
                      uri = r.get("uri", "")
 diff --git a/openviking_cli/utils/config/embedding_config.py b/openviking_cli/utils/config/embedding_config.py
-index cd0be846..c4bdfe3f 100644
+index cd0be846..8f712be0 100644
 --- a/openviking_cli/utils/config/embedding_config.py
 +++ b/openviking_cli/utils/config/embedding_config.py
-@@ -68,7 +68,7 @@ class EmbeddingModelConfig(BaseModel):
-     provider: Optional[str] = Field(
-         default="volcengine",
-         description=(
--            "Provider type: 'openai', 'volcengine', 'vikingdb', 'jina', 'ollama', 'gemini', 'voyage', 'dashscope', 'minimax', 'cohere', 'litellm', 'local'. "
-+            "Provider type: 'openai', 'volcengine', 'vikingdb', 'bge-m3', 'jina', 'ollama', 'gemini', 'voyage', 'dashscope', 'minimax', 'cohere', 'litellm', 'local'. "
-             "For OpenRouter or other OpenAI-compatible providers, use 'litellm' with "
-             "api_base and api_key, or 'openai' with api_base and extra_headers."
-         ),
 @@ -116,7 +116,7 @@ class EmbeddingModelConfig(BaseModel):
      )
      model_path: Optional[str] = Field(
@@ -702,24 +1048,7 @@ index cd0be846..c4bdfe3f 100644
      )
      cache_dir: Optional[str] = Field(
          default=None,
-@@ -170,6 +170,7 @@ class EmbeddingModelConfig(BaseModel):
-         "azure",
-         "volcengine",
-         "vikingdb",
-+        "bge-m3",
-         "jina",
-         "ollama",
-         "gemini",
-@@ -252,7 +253,7 @@ class EmbeddingModelConfig(BaseModel):
-                     f"{label}: VikingDB provider requires the following fields: "
-                     f"{', '.join(missing)}"
-                 )
--        # ollama / litellm / local: no auth requirement enforced here
-+        # ollama / bge-m3 / litellm / local: no auth requirement enforced here
- 
-     @model_validator(mode="after")
-     def validate_config(self):
-@@ -347,9 +348,18 @@ class EmbeddingModelConfig(BaseModel):
+@@ -347,9 +347,18 @@ class EmbeddingModelConfig(BaseModel):
                  )
  
          elif provider == "local":
@@ -740,19 +1069,7 @@ index cd0be846..c4bdfe3f 100644
  
      def _validate_credentials(self) -> None:
          """Validate each credential when credentials list is non-empty.
-@@ -448,6 +458,11 @@ class EmbeddingModelConfig(BaseModel):
- 
-             return get_voyage_model_default_dimension(model)
- 
-+        if provider == "bge-m3":
-+            from openviking.models.embedder.bgem3_embedders import BGE_M3_DIMENSION
-+
-+            return BGE_M3_DIMENSION
-+
-         if provider == "cohere":
-             from openviking.models.embedder.cohere_embedders import (
-                 get_cohere_model_default_dimension,
-@@ -465,6 +480,11 @@ class EmbeddingModelConfig(BaseModel):
+@@ -465,6 +474,11 @@ class EmbeddingModelConfig(BaseModel):
                  get_local_model_default_dimension,
              )
  
@@ -764,19 +1081,7 @@ index cd0be846..c4bdfe3f 100644
              return get_local_model_default_dimension(model)
  
          if provider == "dashscope":
-@@ -534,6 +554,11 @@ class EmbeddingModelConfig(BaseModel):
- 
-             return get_voyage_model_default_dimension(effective_model)
- 
-+        if provider == "bge-m3":
-+            from openviking.models.embedder.bgem3_embedders import BGE_M3_DIMENSION
-+
-+            return BGE_M3_DIMENSION
-+
-         if provider == "cohere":
-             from openviking.models.embedder.cohere_embedders import (
-                 get_cohere_model_default_dimension,
-@@ -577,8 +602,15 @@ class EmbeddingModelConfig(BaseModel):
+@@ -577,8 +591,15 @@ class EmbeddingModelConfig(BaseModel):
              )
  
          if provider == "local":
@@ -793,53 +1098,70 @@ index cd0be846..c4bdfe3f 100644
              return get_local_model_default_dimension(effective_model)
  
          if provider == "dashscope":
-@@ -719,12 +751,14 @@ class EmbeddingConfig(BaseModel):
-             ValueError: If provider/type combination is not supported
-         """
-         from openviking.models.embedder import (
-+            BGEM3HybridEmbedder,
-             CohereDenseEmbedder,
-             DashScopeDenseEmbedder,
-             GeminiDenseEmbedder,
+@@ -697,6 +718,18 @@ class EmbeddingConfig(BaseModel):
+             raise ValueError(
+                 "embedding.text_source must be one of: summary_first, summary_only, content_only"
+             )
++        if self.hybrid and self.hybrid.dimension is None:
++            hybrid_provider = (self.hybrid._effective_provider() or "").lower()
++            if hybrid_provider in {"openai", "azure"}:
++                # An OpenAI-compatible hybrid endpoint is self-hosted, so its
++                # model name resolves to no known dimension and
++                # get_effective_dimension() would fall through to the 2048
++                # default — creating a collection schema the embedder can
++                # never write to.
++                raise ValueError(
++                    f"embedding.hybrid: provider '{hybrid_provider}' requires 'dimension' to be "
++                    "set explicitly (1024 for BGE-M3); it cannot be inferred from the model name"
++                )
+         return self
+ 
+     def _create_embedder(
+@@ -725,8 +758,10 @@ class EmbeddingConfig(BaseModel):
              JinaDenseEmbedder,
              LiteLLMDenseEmbedder,
              LocalDenseEmbedder,
 +            LocalONNXHybridEmbedder,
              MinimaxDenseEmbedder,
              OpenAIDenseEmbedder,
++            OpenAIHybridEmbedder,
              VikingDBDenseEmbedder,
-@@ -841,8 +875,7 @@ class EmbeddingConfig(BaseModel):
-                     **({"query_param": cfg.query_param} if cfg.query_param else {}),
-                     **({"document_param": cfg.document_param} if cfg.document_param else {}),
-                 },
--            ),
--            ("vikingdb", "sparse"): (
-+            ),            ("vikingdb", "sparse"): (
-                 VikingDBSparseEmbedder,
-                 lambda cfg: {
-                     "model_name": cfg.model,
-@@ -870,6 +903,20 @@ class EmbeddingConfig(BaseModel):
-                     **({"document_param": cfg.document_param} if cfg.document_param else {}),
+             VikingDBHybridEmbedder,
+             VikingDBSparseEmbedder,
+@@ -770,6 +805,32 @@ class EmbeddingConfig(BaseModel):
+                     **({"extra_body": cfg.extra_body} if cfg.extra_body else {}),
                  },
              ),
-+            # bge-m3: self-hosted bge-m3-embedding-server, hybrid only
-+            # (its /v1/embeddings:both endpoint returns dense+sparse in one
-+            # forward pass). No auth required; api_key is forwarded as a
-+            # Bearer header when set.
-+            ("bge-m3", "hybrid"): (
-+                BGEM3HybridEmbedder,
++            # openai/hybrid: an OpenAI-compatible endpoint that also serves
++            # BGE-M3's return_dense/return_sparse flags (self-hosted
++            # bge-m3-server, Xinference), returning both representations from
++            # one forward pass. No auth required; api_key is sent when set.
++            ("openai", "hybrid"): (
++                OpenAIHybridEmbedder,
 +                lambda cfg: {
 +                    "model_name": cfg.model,
-+                    "api_key": cfg.api_key,
++                    "api_key": cfg.api_key or "no-key",
 +                    "api_base": cfg.api_base,
++                    "api_version": cfg.api_version,
 +                    "dimension": cfg.dimension,
++                    "provider": "openai",
++                    "configured_provider": "openai",
 +                    "config": dict(runtime_config),
++                    **({"query_param": cfg.query_param} if cfg.query_param else {}),
++                    **({"document_param": cfg.document_param} if cfg.document_param else {}),
++                    **({"extra_headers": cfg.extra_headers} if cfg.extra_headers else {}),
++                    **(
++                        {"encoding_format": cfg.encoding_format}
++                        if cfg.encoding_format is not None
++                        else {}
++                    ),
++                    **({"extra_body": cfg.extra_body} if cfg.extra_body else {}),
 +                },
 +            ),
-             ("jina", "dense"): (
-                 JinaDenseEmbedder,
+             ("azure", "dense"): (
+                 OpenAIDenseEmbedder,
                  lambda cfg: {
-@@ -984,6 +1031,16 @@ class EmbeddingConfig(BaseModel):
+@@ -984,6 +1045,16 @@ class EmbeddingConfig(BaseModel):
                      "config": dict(runtime_config),
                  },
              ),
