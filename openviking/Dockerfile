@@ -7,8 +7,7 @@
 # patch; git apply fails the build if the base image no longer matches it,
 # by design), and the fp32 ONNX model baked into /models. See README.md for
 # patch provenance and ov.conf.
-ARG OPENVIKING_BASE=ghcr.io/volcengine/openviking:latest
-FROM ${OPENVIKING_BASE}
+FROM ghcr.io/volcengine/openviking:v0.4.17.1
 
 # 1. Runtime deps. The base venv is uv-managed and has no pip, so drive it
 # with uv. onnxruntime + numpy are small; transformers provides only the
