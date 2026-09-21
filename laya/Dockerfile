@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.9
 #
 # Laya System One decision runtime: choice / score / noul.
-# Model artifacts are supplied through a read-only /models/laya mount.
+# Model artifacts are supplied through a read-only /models mount.
 # Laya GGUFs use the ggmlc architecture and are not llama.cpp models.
 
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
@@ -28,4 +28,4 @@ RUN mkdir -p /app \
 
 EXPOSE 8080
 ENTRYPOINT ["/app/laya"]
-CMD ["serve", "--models-dir", "/models/laya", "--port", "8080", "--device", "cuda", "--cuda-graph"]
+CMD ["serve", "--models-dir", "/models", "--port", "8080", "--device", "cuda", "--cuda-graph"]
