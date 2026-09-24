@@ -23,8 +23,35 @@ docker run -d --name system-one --gpus '"device=0"' -p 18081:8080 \
   system-one:0.9.2
 ```
 
-`--models-dir` scans the mount, reads each GGUF's `ggmlc.decision` metadata, and
-registers every model it finds. `GET /health` reports the catalog:
+Mount **one GGUF** and pass it directly to serve exactly one model:
+
+```sh
+docker run -d --name system-one --gpus '"device=0"' -p 18081:8080 \
+  -v /path/to/kev_0.8b_q8_0.gguf:/models/model.gguf:ro \
+  system-one:0.9.2 serve /models/model.gguf --port 8080 --device cuda --cuda-graph
+```
+
+`--models-dir` instead scans a directory and registers every GGUF it finds,
+which loads them all. Use that form only when you want several resident at once.
+
+## One binary, both architectures
+
+Verified serving Laya and Kev from one process, alternating per request:
+
+```
+[laya] catalog kev-0.8b    <- /models/kev_0.8b_q8_0.gguf    [ggmlc.decision]
+[laya] catalog multilingual <- /models/laya_multilingual... [laya-compat]
+
+multilingual -> billing (1.0000)   10 ms
+kev-0.8b     -> billing (0.6625)   29 ms
+```
+
+Kev declares its preprocessor in the GGUF (`ggmlc.decision`); Laya's shipped
+GGUFs predate that key and fall back to the built-in Laya preprocessor, reported
+as `recipe=laya-compat`. So the image is not model-specific — only the mounted
+GGUF is.
+
+`GET /health` reports the catalog:
 
 ```
 {"status":"ok","device":"cuda:0","families":["kev-0.8b"],"family":"auto","model":"kev-0.8b"}
@@ -63,22 +90,42 @@ the LoRA merge and export are faithful.
 | Laya english | 512 |
 | Laya multilingual / typed-decisions | 1024 |
 
-Kev's Python runtime serves 8192, but **the ggmlc GGUF is compiled at 2048** —
-the README states it plainly: *"`max_len` is 512 for English, 1024 for the other
-Laya families, 2048 for Kev."* The cap is a property of the compiled artifact,
-so it is not something this image can raise.
+Kev's Python runtime serves 8192, but the ggmlc GGUF is compiled at 2048:
 
-Oversized states are **truncated without an error**. Measured:
+```python
+# examples/laya/kev_trunk.py
+MAX_LEN = 2048  # kev packed cap; row form is state+branch <= 384+1024
+```
 
-| Input | Reported tokens | noul |
+**There is no way to make it error instead of truncate.** The `serve` and
+`decide` help text exposes no length or truncation option, and the binary has no
+`LAYA_*`/`GGMLC_*` environment variables. Measured — every oversized input
+returns HTTP 200 with the tail dropped:
+
+| Input | `usage.input_tokens` | noul |
 |---|---:|---:|
-| ~1400 tok | 2048 | 0.9619 |
-| ~2100 tok | 2048 | **0.9619** |
-| ~4600 tok | 2048 | **0.9619** |
+| ~1,400 tok | 2048 | 0.5050 |
+| ~2,100 tok | 2048 | 0.5050 |
+| ~7,000 tok | 2048 | 0.5050 |
+| ~46,000 tok | 2048 | 0.5050 |
 
-Every oversized input reports exactly 2048 and returns the identical answer, so
-the tail never reaches the model and the caller sees HTTP 200. Keep states under
-2048 tokens, and treat a decision made near that ceiling as suspect.
+**The `usage` block is a usable tell.** `input_tokens` tracks the real size until
+the cap, then pins:
+
+```
+n=10   413      n=40  1493
+n=20   773      n=60  2048  <- at cap, state was cut
+```
+
+So `input_tokens == 2048` means the state was truncated. A one-line client check
+is the only guard available, since nothing in the response headers or status
+signals it.
+
+Raising the cap means recompiling the GGUF: edit `MAX_LEN` and re-run
+`examples/laya/compile_kev.py`. That needs the full ggmlc Python toolchain plus
+PyTorch, and it would run Kev beyond its training lengths — the package's own
+note says the row form is trained at 384 state + 1024 branch, so 2048 is already
+2x the training cap.
 
 ### Measured latency (RTX 3060, Kev-0.8B Q8_0)
 
