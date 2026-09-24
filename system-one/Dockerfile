@@ -18,15 +18,23 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates libgomp1 \
  && rm -rf /var/lib/apt/lists/*
 
-# Official ggmlc CUDA runtime; sm86 targets the RTX 3060 / compute capability 8.6.
+# The `laya` executable from the ggmlc v0.9.2 release. v0.9.2 is the release
+# whose only change is "systemone: add support for handling Kev models in laya
+# executable" (#28), so it is the first version that can serve Kev at all.
+#
+# The asset name says laya because that is the binary's name, but it is not
+# Laya-specific: it is the System One runtime, and it dispatches on the
+# `ggmlc.decision` metadata inside each GGUF. ggmlc's other release binaries
+# (ggmlc-run, tab_completion, timesfm) are a generic tensor runner and unrelated
+# model families; ggmlc-run in particular has no System One logic.
 ARG GGMLC_VERSION=v0.9.2
-ARG GGMLC_ASSET=laya-linux-x86_64-cuda-sm86.tar.gz
-ARG GGMLC_BINARY_SHA256=334e09603c38e6e746cb00eeefb662b8b0ac8ea2f621cba08dad850fbcf52efb
+ARG LAYA_ASSET=laya-linux-x86_64-cuda-sm86.tar.gz
+ARG LAYA_BINARY_SHA256=334e09603c38e6e746cb00eeefb662b8b0ac8ea2f621cba08dad850fbcf52efb
 
 RUN mkdir -p /app \
  && curl -fsSL -o /tmp/laya.tgz \
-      "https://github.com/monatis/ggmlc/releases/download/${GGMLC_VERSION}/${GGMLC_ASSET}" \
- && echo "${GGMLC_BINARY_SHA256}  /tmp/laya.tgz" | sha256sum -c - \
+      "https://github.com/monatis/ggmlc/releases/download/${GGMLC_VERSION}/${LAYA_ASSET}" \
+ && echo "${LAYA_BINARY_SHA256}  /tmp/laya.tgz" | sha256sum -c - \
  && tar -xzf /tmp/laya.tgz -C /tmp \
  && install -m 0755 /tmp/laya /app/laya \
  && rm -rf /tmp/laya /tmp/laya.tgz \
