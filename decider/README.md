@@ -194,6 +194,14 @@ Co-residency is tight — a long state can OOM when free VRAM drops under ~170 M
 Short states are fine with all services running; long states need a co-tenant
 dropped.
 
+Long states also grow the footprint and it does not come back down. A freshly
+started container sits at ~3.3 GiB; after handling 20k-30k-token states the same
+process reports ~6.0 GiB. No graphs are involved (`/stats` shows
+`graph_captures: 0`), so this is PyTorch's caching allocator holding the freed
+activation blocks. They are reused for allocations of the same shape class, but
+they shrink the headroom left for anything else, so a container that has seen
+long traffic and one that has not are not interchangeable. Restart to reclaim.
+
 ## Configuration
 
 `DECIDER_MODEL`, `DECIDER_MAX_STATE_TOKENS` (32768), `DECIDER_DEVICE` (auto),
