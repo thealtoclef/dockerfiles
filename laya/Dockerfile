@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.9
 #
 # ggmlc System One runtime: choice / score / noul in one forward pass.
-# Serves any ggmlc-compiled GGUF (Laya and Kev families) via the `laya` binary.
+# Serves any System One ggmlc-compiled GGUF via the `laya` binary.
 
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
