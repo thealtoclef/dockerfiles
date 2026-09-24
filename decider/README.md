@@ -57,6 +57,75 @@ request runs **eager**: no graph speedup, but bounded memory and no capture OOM
 at runtime. `DECIDER_MAX_BATCH` does *not* bound the grid; that batch list is
 hardcoded in the warmup loop.
 
+## Oversized states are silently truncated by default
+
+`prompt.py` cuts the state with a plain slice:
+
+```python
+ctx_ids = tok.encode("Context:\n" + example.context, add_special_tokens=False)[:max_ctx_tokens]
+```
+
+and the admission check is looser than that cap:
+
+```
+DECIDER_MAX_STATE_TOKENS = 32768   the state is truncated here
+DECIDER_MAX_ROW_TOKENS   = 36864   rows are admitted up to here
+                           ^ 4096-token gap = the tail is dropped, 200 returned
+```
+
+Measured on this card, decisive clause at the **end** of the state:
+
+| Input | Reported tokens | noul |
+|---|---:|---:|
+| 31,260 | 31,260 | 0.9818 |
+| 32,798 | 32,798 | **0.2398** |
+| 32,798 (bigger input) | 32,798 | **0.2398** |
+
+Every oversized input reports the identical 32,798 — the tail never reaches the
+model. With the clause at the **start** of the same oversized state the answer
+stays 0.9863, which is what proves it is truncation and not a long-context
+weakness. It returns HTTP 200 either way.
+
+`DECIDER_MAX_ROW_TOKENS=32768` closes the gap so an oversized row is rejected:
+
+```
+413 {"detail":"too many tokens: one row has 32798 tokens, the limit is 32768 per row"}
+```
+
+A state within the cap still works. The cost is that a state within a few
+tokens of the cap is rejected rather than truncated, which is the safe side of
+that trade.
+
+## CUDA graphs are not worth it on this card
+
+`DECIDER_WARMUP=1` with a reduced grid does work:
+
+```
+DECIDER_T_BUCKETS=64,128,256,512,1024  DECIDER_B_BUCKETS=1,2,4,8
+-> 20 graphs captured in 21s, served normally
+```
+
+But the measured gain does not justify the memory:
+
+| Question count | Eager | With graphs |
+|---:|---:|---:|
+| 1 | 21.2 ms | 19.1 ms |
+| 4 | 50.2 ms | 48.2 ms |
+| 8 | 91.9 ms | 89.0 ms |
+
+~10%, because on a 3060 the forward compute dominates kernel launch overhead.
+The pools cost ~820 MiB and pushed free VRAM from 3.3 GiB to 121 MiB, at which
+point every state above ~3k tokens failed with OOM — including states that the
+eager path had just served. Graphs trade long-state capability for a 2 ms
+saving on short ones, so the image leaves `DECIDER_WARMUP=0`.
+
+The author's "3.2 ms with CUDA graphs" is measured on a B300, where launch
+overhead does dominate.
+
+Long-state latency is therefore inherent, not a configuration problem: the
+eager path is compute-bound, ~3.5 s at 18k tokens on this GPU. Short states are
+the fast path at ~20 ms.
+
 ## Weights
 
 dtype is not configurable — `serve.py` hardcodes bfloat16 on CUDA (float16 on

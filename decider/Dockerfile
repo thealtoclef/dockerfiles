@@ -37,11 +37,16 @@ RUN pip install --upgrade pip \
 # speedup.
 # DECIDER_COMPILE=0: inert in a sealed engine, which never uses the compiled path.
 # DECIDER_FP8=0: fp8 needs torch._scaled_mm, i.e. sm89+; this card is sm86.
+# MAX_ROW_TOKENS matches MAX_STATE_TOKENS: the default MAX_STATE_TOKENS + 4096
+# leaves a gap where the state is truncated but the row is still admitted, so
+# an oversized state silently loses its tail and returns 200. Matching them
+# turns that into a 413.
 ENV DECIDER_WARMUP=0 \
     DECIDER_COMPILE=0 \
     DECIDER_FP8=0 \
     DECIDER_MODEL=Mapika/decider-2b \
-    DECIDER_MAX_STATE_TOKENS=32768
+    DECIDER_MAX_STATE_TOKENS=32768 \
+    DECIDER_MAX_ROW_TOKENS=32768
 
 EXPOSE 8080
 
