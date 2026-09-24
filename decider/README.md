@@ -1,4 +1,4 @@
-# decider-server
+# decider
 
 Mapika's `decider.serve` on CUDA — a trained one-pass decision model behind a
 TypeSafe/Jev-compatible API.
@@ -15,13 +15,13 @@ GET  /v1/models  /health  /stats
 ## Build and run
 
 ```sh
-docker build -t decider-server:0.1.0 .
+docker build -t decider:0.1.0 .
 docker volume create decider-hf-cache
 
-docker run -d --name decider-server --gpus '"device=0"' -p 18081:8080 \
+docker run -d --name decider --gpus '"device=0"' -p 18081:8080 \
   -v decider-hf-cache:/hf \
   -e DECIDER_MODEL=Mapika/decider-2b \
-  decider-server:0.1.0
+  decider:0.1.0
 ```
 
 Weights come from the Hub into `/hf` on first start. Nothing is baked in.

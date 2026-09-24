@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.9
 #
-# decider-server: Mapika's `decider.serve` on CUDA.
+# decider: Mapika's `decider.serve` on CUDA.
 #
 # The published package already binds 0.0.0.0 and serves the TypeSafe wire
 # format, so this only supplies the runtime. Weights are not baked in:
