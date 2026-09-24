@@ -21,7 +21,12 @@ RUN apt-get update \
 # this image exists only to run this server, and torch, triton and numpy already
 # live in the system site-packages at versions that satisfy it. A venv without
 # --system-site-packages would duplicate 3 GB of torch to no benefit.
-RUN pip install --no-cache-dir --break-system-packages "decider-ai[serve]" \
+#
+# Pinned because the model repository was re-released two days before this image
+# was written and the checkpoint's own behaviour keys off `version` in
+# decider_config.json. Serving is a measured configuration here; an implicit
+# upgrade should be a deliberate one.
+RUN pip install --no-cache-dir --break-system-packages "decider-ai[serve]==1.3.0" \
  && python -c "import torch, triton, decider.serve; print('torch', torch.__version__, 'triton', triton.__version__, 'cuda', torch.cuda.is_available())"
 
 EXPOSE 8000
