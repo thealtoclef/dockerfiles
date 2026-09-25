@@ -33,17 +33,14 @@ RUN --mount=type=tmpfs,target=/tmp \
     uv pip install --no-cache --system --break-system-packages --compile-bytecode "decider-ai[serve]==1.3.0" \
  && python -c "import torch, triton, decider.serve; print('torch', torch.__version__, 'triton', triton.__version__, 'cuda', torch.cuda.is_available())"
 
-# Optional arena reservation at the state cap; see the module docstring. With
-# DECIDER_RESERVE unset the app is re-exported unchanged.
-COPY reserve.py /app/reserve.py
-WORKDIR /app
-RUN python -c "import reserve; print('reserve gate:', reserve.RESERVE, 'cap', reserve.CAP)"
-
 # Unconditional: no apt state survives in the runtime image, whether or not the
-# steps above installed anything.
+# install above used it.
 RUN rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 
 EXPOSE 8000
 
-ENTRYPOINT ["uvicorn", "reserve:app"]
+# The package's own entrypoint. Nothing of ours runs in the server: the
+# footprint is set by DECIDER_WARMUP, the caps and the forward budget, all of
+# which are environment variables the package already reads.
+ENTRYPOINT ["uvicorn", "decider.serve:app"]
 CMD ["--host", "0.0.0.0", "--port", "8000"]
