@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.9
 
-FROM pytorch/pytorch:2.14.0-cuda13.0-cudnn9-runtime
+FROM pytorch/pytorch:2.14.0-cuda12.6-cudnn9-runtime
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl \
