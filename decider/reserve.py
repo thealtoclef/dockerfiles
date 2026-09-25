@@ -22,6 +22,8 @@ process to 6,983 MiB and leaves 103 MiB on the card - see docs/decider-official.
 import os
 from contextlib import asynccontextmanager
 
+import torch
+
 import decider.serve as serve
 from decider.serve import app
 
@@ -46,8 +48,21 @@ async def _lifespan(app_):
             if eng is None:
                 raise RuntimeError("decider.serve.eng is unset after startup; nothing to reserve")
             shape = eng.pad_len(CAP)
-            took = eng.warmup(shapes=[(1, shape)])
-            print(f"[reserve] arena reserved at {shape} tokens (cap {CAP}) in {took:.1f}s", flush=True)
+            try:
+                took = eng.warmup(shapes=[(1, shape)])
+                print(f"[reserve] arena reserved at {shape} tokens (cap {CAP}) in {took:.1f}s", flush=True)
+            except torch.cuda.OutOfMemoryError as e:
+                # Reserving is an optimisation, not a requirement: the arena
+                # reaches the same ceiling on the first request that needs it. A
+                # failure here must not take the server down, because with
+                # `restart: unless-stopped` that turns into a restart loop that
+                # retries the same doomed allocation. This happens when another
+                # GPU tenant holds more than expected, which is exactly when
+                # serving at all matters most.
+                torch.cuda.empty_cache()
+                print(f"[reserve] skipped: not enough free memory to reserve {shape} tokens "
+                      f"({type(e).__name__}). Serving unreserved; the arena will grow on demand "
+                      f"to at most the same ceiling.", flush=True)
         yield
 
 
