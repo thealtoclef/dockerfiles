@@ -179,14 +179,14 @@ def render_metrics():
     ]
     for upstream in _upstreams:
         state = 0 if upstream.failures else 1
-        lines.append(f'relay_upstream_up{{endpoint="{upstream.endpoint}"}} {state}')
+        lines.append(f'relay_upstream_up{{upstream="{upstream.endpoint}"}} {state}')
     lines += [
         "# HELP relay_upstream_failures_total Failed requests since startup; 0 means the upstream is healthy.",
         "# TYPE relay_upstream_failures_total gauge",
     ]
     for upstream in _upstreams:
         lines.append(
-            f'relay_upstream_failures_total{{endpoint="{upstream.endpoint}"}} {upstream.failures}'
+            f'relay_upstream_failures_total{{upstream="{upstream.endpoint}"}} {upstream.failures}'
         )
     return "\n".join(lines) + "\n"
 
