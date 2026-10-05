@@ -43,7 +43,10 @@ UPSTREAMS = [
     if endpoint.strip()
 ]
 BIND = os.environ.get("BIND_ENDPOINT", "tcp://*:5590")
-INFER_TIMEOUT_MS = int(os.environ.get("INFER_TIMEOUT_MS", "1000"))
+# Must stay far below Frigate's detectors.*.request_timeout_ms (2s here): a request
+# that exceeds it makes Frigate reset the detector and re-run the model
+# handshake, which costs a detection gap. Measured fallback latency is ~40ms.
+INFER_TIMEOUT_MS = int(os.environ.get("INFER_TIMEOUT_MS", "800"))
 MODEL_TIMEOUT_MS = int(os.environ.get("MODEL_TIMEOUT_MS", "5000"))
 COOLDOWN_S = float(os.environ.get("COOLDOWN_S", "3"))
 MAX_COOLDOWN_S = float(os.environ.get("MAX_COOLDOWN_S", "60"))
