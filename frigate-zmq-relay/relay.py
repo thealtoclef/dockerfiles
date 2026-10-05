@@ -48,7 +48,7 @@ MODEL_TIMEOUT_MS = int(os.environ.get("MODEL_TIMEOUT_MS", "5000"))
 COOLDOWN_S = float(os.environ.get("COOLDOWN_S", "3"))
 MAX_COOLDOWN_S = float(os.environ.get("MAX_COOLDOWN_S", "60"))
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "9090"))
-PROBE_INTERVAL_S = float(os.environ.get("PROBE_INTERVAL_S", "60"))
+PROBE_INTERVAL_S = float(os.environ.get("PROBE_INTERVAL_S", "30"))
 
 ZERO_REPLY = [
     json.dumps({"shape": [20, 6], "dtype": "float32"}).encode("utf-8"),
@@ -81,6 +81,11 @@ class Upstream:
     @property
     def parked(self):
         return time.monotonic() < self.parked_until
+
+    @property
+    def healthy(self):
+        """True until this upstream has failed. Only healthy upstreams serve requests."""
+        return self.failures == 0
 
     def request(self, frames, timeout_ms):
         """Return reply frames, or None and park this upstream on failure."""
@@ -118,10 +123,15 @@ class Upstream:
 
 
 def forward(frames, timeout_ms):
-    """Forward frames to the first upstream that is not parked. None if nobody answers."""
+    """Serve from the first healthy upstream. None if nobody is healthy.
+
+    An upstream that has failed is skipped even once its backoff expires: only
+    the probe thread re-admits it. Retrying it here would make a real detection
+    request pay the full timeout before falling through to a working upstream.
+    """
     with _lock:
         for upstream in _upstreams:
-            if upstream.parked:
+            if not upstream.healthy:
                 continue
             reply = upstream.request(frames, timeout_ms)
             if reply is not None:
@@ -142,18 +152,19 @@ PROBE_FRAMES = [
 
 
 def probe_loop():
-    """Keep upstream health current while Frigate is idle.
+    """Own upstream recovery, and keep the metrics current while Frigate is idle.
 
-    Frigate only sends a request when it has a region to detect, so an idle
-    night would otherwise leave the metrics stale. Probes reuse the normal
-    request path (and its backoff), so a dead upstream still parks and alerts.
+    Frigate only sends a request when it has a region to detect, so an idle night
+    would otherwise leave the metrics stale. This is also the only place that
+    retries a failed upstream, so re-admitting a slow-to-answer detector never
+    costs a real detection request its timeout budget.
     """
     while True:
         time.sleep(PROBE_INTERVAL_S)
-        for upstream in _upstreams:
-            if upstream.parked:
-                continue
-            with _lock:
+        with _lock:
+            for upstream in _upstreams:
+                if upstream.healthy or upstream.parked:
+                    continue
                 upstream.request(PROBE_FRAMES, INFER_TIMEOUT_MS)
 
 
