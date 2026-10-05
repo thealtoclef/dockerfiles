@@ -48,6 +48,7 @@ MODEL_TIMEOUT_MS = int(os.environ.get("MODEL_TIMEOUT_MS", "5000"))
 COOLDOWN_S = float(os.environ.get("COOLDOWN_S", "3"))
 MAX_COOLDOWN_S = float(os.environ.get("MAX_COOLDOWN_S", "60"))
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "9090"))
+PROBE_INTERVAL_S = float(os.environ.get("PROBE_INTERVAL_S", "60"))
 
 ZERO_REPLY = [
     json.dumps({"shape": [20, 6], "dtype": "float32"}).encode("utf-8"),
@@ -56,6 +57,7 @@ ZERO_REPLY = [
 
 ctx = zmq.Context.instance()
 _upstreams = []
+_lock = threading.Lock()
 
 
 class Upstream:
@@ -117,17 +119,42 @@ class Upstream:
 
 def forward(frames, timeout_ms):
     """Forward frames to the first upstream that is not parked. None if nobody answers."""
-    for upstream in _upstreams:
-        if upstream.parked:
-            continue
-        reply = upstream.request(frames, timeout_ms)
-        if reply is not None:
-            return reply
+    with _lock:
+        for upstream in _upstreams:
+            if upstream.parked:
+                continue
+            reply = upstream.request(frames, timeout_ms)
+            if reply is not None:
+                return reply
     return None
 
 
 def _json(payload):
     return [json.dumps(payload).encode("utf-8")]
+
+
+PROBE_FRAMES = [
+    json.dumps(
+        {"shape": [1, 3, 320, 320], "dtype": "float32", "model_type": "yologeneric"}
+    ).encode("utf-8"),
+    b"\x00" * (1 * 3 * 320 * 320 * 4),
+]
+
+
+def probe_loop():
+    """Keep upstream health current while Frigate is idle.
+
+    Frigate only sends a request when it has a region to detect, so an idle
+    night would otherwise leave the metrics stale. Probes reuse the normal
+    request path (and its backoff), so a dead upstream still parks and alerts.
+    """
+    while True:
+        time.sleep(PROBE_INTERVAL_S)
+        for upstream in _upstreams:
+            if upstream.parked:
+                continue
+            with _lock:
+                upstream.request(PROBE_FRAMES, INFER_TIMEOUT_MS)
 
 
 def render_metrics():
@@ -178,6 +205,8 @@ def main():
     global _upstreams
     _upstreams = [Upstream(endpoint) for endpoint in UPSTREAMS]
     start_metrics_server()
+    if PROBE_INTERVAL_S > 0:
+        threading.Thread(target=probe_loop, daemon=True).start()
 
     frontend = ctx.socket(zmq.REP)
     frontend.setsockopt(zmq.LINGER, 0)
