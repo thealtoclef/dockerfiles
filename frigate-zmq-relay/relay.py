@@ -155,18 +155,19 @@ PROBE_FRAMES = [
 
 
 def probe_loop():
-    """Own upstream recovery, and keep the metrics current while Frigate is idle.
+    """Own upstream health: probe every upstream on a timer.
 
     Frigate only sends a request when it has a region to detect, so an idle night
-    would otherwise leave the metrics stale. This is also the only place that
-    retries a failed upstream, so re-admitting a slow-to-answer detector never
-    costs a real detection request its timeout budget.
+    would otherwise leave the metrics stale. Probing healthy upstreams too is
+    what keeps `relay_upstream_up` honest for the local fallback: nothing else
+    ever touches it while the workstation is answering, so a dead fallback would
+    otherwise stay invisible until a failover needed it.
     """
     while True:
         time.sleep(PROBE_INTERVAL_S)
         with _lock:
             for upstream in _upstreams:
-                if upstream.healthy or upstream.parked:
+                if upstream.parked:
                     continue
                 upstream.request(PROBE_FRAMES, INFER_TIMEOUT_MS)
 
