@@ -1,5 +1,5 @@
 # Merged relay image: the ZMQ relay plus a local iGPU detector it can fall back
-# to, so Frigate keeps detecting when the RTX 3060 workstation is off.
+# to, so Frigate keeps detecting when the remote GPU host is off.
 #
 # The base must be the garymathews ROCm 7.2.4 image, not the official
 # blakeblackshear one: the official 0.18.0-rocm ships ROCm 7.2.3, whose rocBLAS
