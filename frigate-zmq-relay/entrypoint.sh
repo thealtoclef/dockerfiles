@@ -4,7 +4,7 @@
 #
 # The relay never depends on the child being up: it parks an upstream that fails
 # and re-probes it, so the several minutes MIGraphX takes to compile the model at
-# startup only mean the RTX 3060 serves until the local detector answers.
+# startup only mean the primary serves until the local detector answers.
 #
 # The detector is restarted if it exits, so a crash cannot silently leave the
 # fallback dead until the next pod restart.

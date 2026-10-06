@@ -16,7 +16,7 @@ This relay keeps Frigate's endpoint local and always responsive:
     detections.
 
 Result: Frigate's detector is always "ready" (init never fails), recording stays
-independent of the workstations, and detection resumes automatically once any
+independent of the remote detector hosts, and detection resumes once any
 upstream returns.
 
 Per-upstream health is exported on METRICS_PORT (/metrics), so a scrape can tell
@@ -37,11 +37,14 @@ log = logging.getLogger("zmq-relay")
 
 UPSTREAMS = [
     endpoint.strip()
-    for endpoint in os.environ.get(
-        "UPSTREAM_ENDPOINTS", "tcp://10.0.0.10:5590"
-    ).split(",")
+    for endpoint in os.environ.get("UPSTREAM_ENDPOINTS", "").split(",")
     if endpoint.strip()
 ]
+if not UPSTREAMS:
+    raise SystemExit(
+        "UPSTREAM_ENDPOINTS is required: comma-separated detector endpoints in "
+        "priority order, e.g. tcp://10.0.0.10:5590,tcp://127.0.0.1:5591"
+    )
 BIND = os.environ.get("BIND_ENDPOINT", "tcp://*:5590")
 # Must stay far below Frigate's detectors.*.request_timeout_ms (2s here): a request
 # that exceeds it makes Frigate reset the detector and re-run the model
@@ -160,7 +163,7 @@ def probe_loop():
     Frigate only sends a request when it has a region to detect, so an idle night
     would otherwise leave the metrics stale. Probing healthy upstreams too is
     what keeps `relay_upstream_up` honest for the local fallback: nothing else
-    ever touches it while the workstation is answering, so a dead fallback would
+    ever touches it while the primary is answering, so a dead fallback would
     otherwise stay invisible until a failover needed it.
     """
     while True:
