@@ -10,9 +10,9 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates libgomp1 \
  && rm -rf /var/lib/apt/lists/*
 
-ARG LAYA_VERSION=v0.9.2
+ARG LAYA_VERSION=v0.9.7
 ARG LAYA_ASSET=laya-linux-x86_64-cuda-sm86.tar.gz
-ARG LAYA_SHA256=334e09603c38e6e746cb00eeefb662b8b0ac8ea2f621cba08dad850fbcf52efb
+ARG LAYA_SHA256=9d7e5379b24587a81c3943caf3f60a25f1aa9be1ce5236f8df649d6b1896c424
 
 RUN mkdir -p /app \
  && curl -fsSL -o /tmp/laya.tgz \
